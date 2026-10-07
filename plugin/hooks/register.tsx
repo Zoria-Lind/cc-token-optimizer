@@ -1,6 +1,10 @@
 // cc-token-optimizer — mods 层:AbovePrompt 悬浮条(含 compactionDriver ⚠ 提示)+ /token-status 统计。
 // 数据源:turn.complete 的 usage 聚合(仅主会话,排除 subagent)+ $.session.usage() 的上下文快照。
-// 铁律:任何异常静默放行;所有数值为会话内累计,热重载/重启清零。
+// 铁律:任何异常静默放行。
+// 累计口径(B 修正 2026-10-08):计数持久在 $.state(宿主保存、热重载不清零),按会话 startedAt 分账 ——
+//   热重载不再丢已计轮次;新会话 / `/clear`(startedAt 变)自然开新账;多窗口并发各记各的,互不覆盖。
+// 诊断刻度:每次 register() 往账本记一行 loads{时刻, 当时轮数, 当时无 usage 轮数} ——
+//   事后可判定缺数是"热重载丢的"还是"事件本身没收到"(口径行见 /token-status)。
 import type { Register } from 'claude-code'
 
 const fmt = (n: number): string =>
@@ -72,12 +76,86 @@ const missPart = (inputT: number, read: number, creation: number): number =>
 const totalInputTokens = (inputT: number, read: number, creation: number): number =>
   read > inputT ? inputT + read + creation : inputT
 
+// 时间刻度(HH:MM / M-D HH:MM):不走 Intl(沙箱里未必有),手拼
+const hm = (ms: number | null): string => {
+  if (ms === null || !Number.isFinite(ms)) return '—'
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+const stamp = (ms: number | null): string => {
+  if (ms === null || !Number.isFinite(ms)) return '—'
+  const d = new Date(ms)
+  return `${d.getMonth() + 1}-${d.getDate()} ${hm(ms)}`
+}
+
+// ---- 会话账本(跨热重载持久:B 修正)----
+type LoadMark = { at: number; turns: number; noUsage: number }
+type UsageTotals = {
+  startedAt: number | null // 会话标识($.session.usage().startedAt):变了就是新会话
+  loadAt: number // 写入者加载时刻 —— 更晚的实例接管账本,旧实例不得覆盖新实例
+  turns: number
+  turnsNoUsage: number // 主会话里 usage 缺失的轮次(中断/API 错误):CC 不给 usage,单独计数(诊断用)
+  subagentTurns: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheCreation: number
+  firstAt: number | null // 本会话首轮计数时刻
+  lastAt: number | null
+  loads: LoadMark[] // 诊断刻度:每次 register() 一行
+}
+type UsageBook = Record<string, UsageTotals> // key = String(startedAt):多窗口并发各记各的
+// $.state 引用:验证器要求 plugin/key 是字面量(与 behavior-enhancer 的 REGISTRY 同款形状)
+const USAGE_REF = { plugin: 'cc-token-optimizer', key: 'usage-totals' } as const
+const BOOK_KEEP = 3
+const newTotals = (startedAt: number | null, loadAt: number): UsageTotals => ({
+  startedAt, loadAt, turns: 0, turnsNoUsage: 0, subagentTurns: 0,
+  input: 0, output: 0, cacheRead: 0, cacheCreation: 0, firstAt: null, lastAt: null, loads: [],
+})
+// 读账本:同会话(startedAt 相同)则接续并把本次加载记成一行刻度;否则开新账
+const readTotals = async ($: any, loadAt: number): Promise<UsageTotals> => {
+  let startedAt: number | null = null
+  try {
+    const u = await $.session.usage()
+    if (typeof u?.startedAt === 'number') startedAt = u.startedAt
+  } catch { /* fail-open:拿不到会话标识 → 记到 "null" 格 */ }
+  try {
+    const book = ((await $.state.get(USAGE_REF))?.value ?? {}) as UsageBook
+    const prev = book[String(startedAt)]
+    if (prev && typeof prev.turns === 'number') {
+      return {
+        ...newTotals(startedAt, loadAt),
+        ...prev,
+        loadAt,
+        loads: [...(prev.loads ?? []), { at: loadAt, turns: prev.turns, noUsage: prev.turnsNoUsage ?? 0 }].slice(-20),
+      }
+    }
+  } catch { /* fail-open */ }
+  return { ...newTotals(startedAt, loadAt), loads: [{ at: loadAt, turns: 0, noUsage: 0 }] }
+}
+// 写账本:只覆盖自己这格,顺手裁掉最旧的会话(最多留 BOOK_KEEP 格)
+const saveTotals = async ($: any, T: UsageTotals): Promise<void> => {
+  try {
+    const book = ((await $.state.get(USAGE_REF))?.value ?? {}) as UsageBook
+    const key = String(T.startedAt)
+    const prev = book[key]
+    if (prev && typeof prev.loadAt === 'number' && prev.loadAt > T.loadAt) return // 更新的实例已接管
+    const next: UsageBook = { ...book, [key]: T }
+    const keys = Object.keys(next)
+    if (keys.length > BOOK_KEEP) {
+      keys.sort((a, b) => (next[b]?.lastAt ?? next[b]?.loadAt ?? 0) - (next[a]?.lastAt ?? next[a]?.loadAt ?? 0))
+      for (const k of keys.slice(BOOK_KEEP)) delete next[k]
+    }
+    await $.state.set(USAGE_REF, next)
+  } catch { /* fail-open */ }
+}
+
 export const register: Register = (on) => {
-  let turns = 0
-  let input = 0
-  let output = 0
-  let cacheRead = 0
-  let cacheCreation = 0
+  const loadAt = Date.now()
+  let T = newTotals(null, loadAt)
+  let ready: Promise<void> | null = null
+  // 惰性水合:首次用到账本时从 $.state 接续(热重载后的新实例由此寻回已计轮次)。
+  // ⚠ 水合必须内联在各 hook 体内 —— 插件验证器只允许 $ 传给文件顶层的函数(readTotals 即顶层)。
 
   // compactionDriver:上下文过半时提醒 /compact(每会话 ≤3 次,相邻提醒 ≥6 轮;DSH 版同款设计)
   const COMPACT_WARN_PCT = 50
@@ -87,12 +165,14 @@ export const register: Register = (on) => {
   let lastCompactRemindTurn = -10
 
   const totals = () => {
-    const totalIn = totalInputTokens(input, cacheRead, cacheCreation)
-    const hit = totalIn > 0 ? (100 * cacheRead) / totalIn : null
+    const totalIn = totalInputTokens(T.input, T.cacheRead, T.cacheCreation)
+    const hit = totalIn > 0 ? (100 * T.cacheRead) / totalIn : null
     return { totalIn, hit }
   }
 
   on('session.start', async ($, _e, next) => {
+    if (!ready) ready = readTotals($, loadAt).then((t) => { T = t })
+    await ready.catch(() => { /* fail-open */ })
     try {
       await $.command.register({
         name: 'token-status',
@@ -102,21 +182,34 @@ export const register: Register = (on) => {
     return next(_e)
   })
 
-  on('turn.complete', ($, e, next) => {
+  on('turn.complete', async ($, e, next) => {
     try {
-      if (!e.agentId && e.usage) {
-        turns += 1
-        input += e.usage.input_tokens ?? 0
-        output += e.usage.output_tokens ?? 0
-        cacheRead += e.usage.cache_read_input_tokens ?? 0
-        cacheCreation += e.usage.cache_creation_input_tokens ?? 0
+      if (!ready) ready = readTotals($, loadAt).then((t) => { T = t })
+      await ready
+      if (e.agentId) {
+        T.subagentTurns += 1
+      } else if (e.usage) {
+        T.turns += 1
+        T.input += e.usage.input_tokens ?? 0
+        T.output += e.usage.output_tokens ?? 0
+        T.cacheRead += e.usage.cache_read_input_tokens ?? 0
+        T.cacheCreation += e.usage.cache_creation_input_tokens ?? 0
+        const now = Date.now()
+        if (T.firstAt === null) T.firstAt = now
+        T.lastAt = now
+        await saveTotals($, T) // 写穿:热重载/崩溃都不丢
+      } else {
+        T.turnsNoUsage += 1 // 中断/API 错误:CC 不给 usage,单独记(诊断口径用)
+        await saveTotals($, T)
       }
     } catch { /* fail-open */ }
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (turns === 0) return next(e)
+    if (!ready) ready = readTotals($, loadAt).then((t) => { T = t })
+    await ready.catch(() => { /* fail-open */ })
+    if (T.turns === 0) return next(e)
     let ctxText = ''
     let ctxPct: number | null = null
     try {
@@ -129,9 +222,9 @@ export const register: Register = (on) => {
       }
     } catch { /* fail-open */ }
     let compactWarn = ''
-    if (ctxPct !== null && ctxPct >= COMPACT_WARN_PCT && compactReminded < COMPACT_MAX_REMIND && turns - lastCompactRemindTurn >= COMPACT_TURN_GAP) {
+    if (ctxPct !== null && ctxPct >= COMPACT_WARN_PCT && compactReminded < COMPACT_MAX_REMIND && T.turns - lastCompactRemindTurn >= COMPACT_TURN_GAP) {
       compactReminded += 1
-      lastCompactRemindTurn = turns
+      lastCompactRemindTurn = T.turns
       compactWarn = ' ⚠ ctx ' + ctxPct + '% · 建议 /compact'
     }
     const { totalIn, hit } = totals()
@@ -142,12 +235,14 @@ export const register: Register = (on) => {
     const pro = isProModel(cfg, model)
     const pricing = pro ? cfg.pricing.pro : cfg.pricing.cheap
     const peak = isPeakAt(cfg.holidays)
-    const cost = costYuan(pricing, missPart(input, cacheRead, cacheCreation), cacheRead, output, peak)
+    const cost = costYuan(pricing, missPart(T.input, T.cacheRead, T.cacheCreation), T.cacheRead, T.output, peak)
+    // A:口径标记 —— 热重载续计过的会话在条上明示(没发生过就不占位置)
+    const reloadMark = T.loads.length > 1 ? ` · 续计${T.loads.length - 1}载` : ''
     return (
       <Box>
         <Text dimColor>
-          [opt] {turns}轮 · ctx {ctxText || '?'} · 输入 {fmt(input)} + 缓存读 {fmt(cacheRead)} / 写 {fmt(cacheCreation)} · 输出 {fmt(output)}
-          {hit !== null ? ` · 命中 ${hit.toFixed(1)}%` : ''} · ¥{cost.toFixed(2)}{peak ? ' 高峰' : ''}{pro ? '·Pro' : '·基础档'}
+          [opt] {T.turns}轮 · ctx {ctxText || '?'} · 输入 {fmt(T.input)} + 缓存读 {fmt(T.cacheRead)} / 写 {fmt(T.cacheCreation)} · 输出 {fmt(T.output)}
+          {hit !== null ? ` · 命中 ${hit.toFixed(1)}%` : ''} · ¥{cost.toFixed(2)}{peak ? ' 高峰' : ''}{pro ? '·Pro' : '·基础档'}{reloadMark}
         </Text>
         {compactWarn !== '' && <Text>{compactWarn}</Text>}
       </Box>
@@ -155,6 +250,8 @@ export const register: Register = (on) => {
   })
 
   on('command.run', { command: 'token-status' }, async ($) => {
+    if (!ready) ready = readTotals($, loadAt).then((t) => { T = t })
+    await ready.catch(() => { /* fail-open */ })
     const { totalIn, hit } = totals()
     const cfg = await loadConfig($)
     let model: string | null = null
@@ -162,9 +259,9 @@ export const register: Register = (on) => {
     const pro = isProModel(cfg, model)
     const pricing = pro ? cfg.pricing.pro : cfg.pricing.cheap
     const peak = isPeakAt(cfg.holidays)
-    const uncached = missPart(input, cacheRead, cacheCreation)
-    const cost = costYuan(pricing, uncached, cacheRead, output, peak)
-    const outShare = totalIn > 0 ? Math.round((100 * output) / (totalIn + output)) : null
+    const uncached = missPart(T.input, T.cacheRead, T.cacheCreation)
+    const cost = costYuan(pricing, uncached, T.cacheRead, T.output, peak)
+    const outShare = totalIn > 0 ? Math.round((100 * T.output) / (totalIn + T.output)) : null
     let compactLine = ''
     let compactNote = ''
     try {
@@ -177,14 +274,15 @@ export const register: Register = (on) => {
     } catch { /* fail-open */ }
     return {
       text: [
-        'cc-token-optimizer 统计(会话内累计,重启/热重载清零):',
+        'cc-token-optimizer 统计(本会话累计,存 $.state 跨热重载续计;新会话 / `/clear` 归零):',
         `- 当前模型: ${model ?? '未知'}(${pro ? 'Pro 档' : '基础档'},按 config.json 价目计价)`,
-        `- 轮次: ${turns}`,
-        `- 输入 ${fmt(input)} / 缓存读 ${fmt(cacheRead)} / 缓存写 ${fmt(cacheCreation)} / 输出 ${fmt(output)}`,
+        `- 轮次: ${T.turns}${T.turnsNoUsage > 0 || T.subagentTurns > 0 ? `(另有 usage 缺失 ${T.turnsNoUsage} 轮、子代理 ${T.subagentTurns} 轮,未计价)` : ''}`,
+        `- 输入 ${fmt(T.input)} / 缓存读 ${fmt(T.cacheRead)} / 缓存写 ${fmt(T.cacheCreation)} / 输出 ${fmt(T.output)}`,
         `- 缓存命中率: ${hit !== null ? `${hit.toFixed(1)}%` : '暂无数据'}`,
-        `- 成本(¥,${pro ? 'Pro' : '基础'}档): ¥${cost.toFixed(3)}(${peak ? '高峰' : '空闲'}价) · 输入未命中 ¥${((uncached * pricing[peak ? 'peak' : 'idle'].miss) / 1_000_000).toFixed(3)} / 命中 ¥${((cacheRead * pricing[peak ? 'peak' : 'idle'].hit) / 1_000_000).toFixed(3)} / 输出 ¥${((output * pricing[peak ? 'peak' : 'idle'].out) / 1_000_000).toFixed(3)}`,
+        `- 成本(¥,${pro ? 'Pro' : '基础'}档): ¥${cost.toFixed(3)}(${peak ? '高峰' : '空闲'}价) · 输入未命中 ¥${((uncached * pricing[peak ? 'peak' : 'idle'].miss) / 1_000_000).toFixed(3)} / 命中 ¥${((T.cacheRead * pricing[peak ? 'peak' : 'idle'].hit) / 1_000_000).toFixed(3)} / 输出 ¥${((T.output * pricing[peak ? 'peak' : 'idle'].out) / 1_000_000).toFixed(3)}`,
         outShare !== null ? `- 输出占比 ${outShare}%(输出含思考 token;cacheCreation 按未命中价计)` : '- 输出占比: 暂无数据',
-        '- 口径: 来自 turn.complete usage 聚合(仅主会话);高峰=工作日 9-12/14-18 且非法定节假日,周末(含调休周末)与节假日全空闲;价目/档位/升级规则在 plugin/config.json。',
+        `- 统计窗口: 会话始于 ${stamp(T.startedAt)} · 首轮于 ${hm(T.firstAt)} · 本实例 register 加载 ${T.loads.length} 次${T.loads.length > 1 ? '(热重载过 → 已续计,未丢轮次)' : '(未重载)'}${T.loads.length >= 20 ? ' ⚠ 加载次数触顶,可能频繁重载' : ''}`,
+        '- 口径: 来自 turn.complete usage 聚合(仅主会话;该事件 usage = 该轮所有真实请求之和,CC 类型定义原文);计数持久在 $.state,热重载不清零;高峰=工作日 9-12/14-18 且非法定节假日,周末(含调休周末)与节假日全空闲;价目/档位/升级规则在 plugin/config.json。',
         '- hooks 层(readDedup/outputTrim/coldStartGuard/modelDirector)计数见 <CLAUDE_CONFIG_DIR>/token-optimizer/state.json 与工具结果标注。',
         compactLine,
       ].filter(Boolean).join('\n'),

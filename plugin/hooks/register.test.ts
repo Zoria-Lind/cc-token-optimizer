@@ -23,7 +23,18 @@ const setup = (on: any) => {
   }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('turn.complete', () => ({ text: 'ok' }))
-  return { registered }
+  // 虚拟 state(账本持久化的落点):Map 实现;插件的 $.state.get/set 沿链下到这里
+  // (与 behavior-enhancer 测试同款形状:get 回 { value, version },set 回 { isSet, version })
+  const state = new Map<string, unknown>()
+  let version = 0
+  on('state.get', (_$: any, e: any) => ({ value: { value: state.get(`${e.plugin}:${e.key}`), version } }))
+  on('state.set', (_$: any, e: any) => {
+    if (typeof e.ifVersion === 'number' && e.ifVersion !== version) return { value: { isSet: false, version } }
+    state.set(`${e.plugin}:${e.key}`, e.value)
+    version += 1
+    return { value: { isSet: true, version } }
+  })
+  return { registered, state }
 }
 
 const start = async ($: any) => {
@@ -63,6 +74,48 @@ test('usage 字段缺失不崩溃(防御性聚合)', async ($, on) => {
   expect(out.text).toMatch(/轮次: 0/)
   expect(out.text).toMatch(/命中率: 暂无数据/)
 })
+test('B:账本跨热重载接续 —— 预置同会话账本 → 接着累加,不再从零', async ($, on) => {
+  const b = setup(on)
+  // 模拟"上一实例已经计了 2 轮"(startedAt 与 mock 的 session.usage 一致 = 0)
+  b.state.set('cc-token-optimizer:usage-totals', {
+    '0': {
+      startedAt: 0, loadAt: 1, turns: 2, turnsNoUsage: 0, subagentTurns: 0,
+      input: 500, output: 200, cacheRead: 5000, cacheCreation: 0,
+      firstAt: 1, lastAt: 2, loads: [{ at: 1, turns: 0, noUsage: 0 }],
+    },
+  })
+  await start($)
+  await turn($, { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 }, undefined)
+  const out = await $.command.run({ command: 'token-status' })
+  expect(out.text).toMatch(/轮次: 3/) // 2(上一实例) + 1(本轮) —— 修复前这里会是 1
+  expect(out.text).toMatch(/缓存读 14k/) // 5000 + 9000
+  expect(out.text).toMatch(/register 加载 2 次\(热重载过 → 已续计,未丢轮次\)/)
+})
+
+test('B:账本属于别的会话(startedAt 不同)→ 开新账,不串数', async ($, on) => {
+  const b = setup(on)
+  b.state.set('cc-token-optimizer:usage-totals', {
+    '999': {
+      startedAt: 999, loadAt: 1, turns: 42, turnsNoUsage: 0, subagentTurns: 0,
+      input: 1, output: 1, cacheRead: 1, cacheCreation: 0, firstAt: 1, lastAt: 2, loads: [],
+    },
+  })
+  await start($)
+  await turn($, { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 }, undefined)
+  const out = await $.command.run({ command: 'token-status' })
+  expect(out.text).toMatch(/轮次: 1/) // 不是 43
+  expect(out.text).toMatch(/register 加载 1 次\(未重载\)/)
+})
+
+test('usage 缺失的轮次单独计数(诊断口径:区分"没收到事件"与"CC 没给 usage")', async ($, on) => {
+  setup(on)
+  await start($)
+  await turn($, null, undefined)
+  await turn($, { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 400, cache_creation_input_tokens: 0 }, undefined)
+  const out = await $.command.run({ command: 'token-status' })
+  expect(out.text).toMatch(/轮次: 1\(另有 usage 缺失 1 轮、子代理 0 轮,未计价\)/)
+})
+
 // 悬浮条(AbovePrompt)不做单元断言:测试框架要求 ui.render 的 bottom 返回真实树元素,
 // 而元素构造器只存在于引擎内部,测试 bottom 拿不到。其验证由三层兜底:
 // engine validate(API 形状)+ 热重载零失败(引擎加载)+ /token-status(数据路径)+ 用户肉眼(输入框上方)。
