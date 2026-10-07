@@ -1,0 +1,21 @@
+{
+  "_comment": "两档自选名单,可自行增删工具名:tier1_remove=确认不用的直接移除;tier2_hide=偶尔用的,移出调用范围但保留在此,node tool-gate.mjs enable <tool> 一条命令召回。ReportFindings 因 /code-review 技能依赖暂不列入(要禁就技能一起弃用)。改完跑:node tool-gate.mjs apply,然后重启会话生效。",
+  "tier1_remove": [
+    "DesignSync",
+    "NotebookEdit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ScheduleWakeup",
+    "Workflow",
+    "SendFeedback",
+    "ListAgents",
+    "SendMessage"
+  ],
+  "tier2_hide": [
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Monitor",
+    "PushNotification"
+  ]
+}

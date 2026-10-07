@@ -1,0 +1,6 @@
+{
+  "name": "cc-token-optimizer",
+  "version": "0.1.0",
+  "description": "Claude Code 会话 token 监视:上下文压力/累计 token/缓存命中率悬浮条 + /token-status 统计。与 settings-hook 层(hooks/token-hook.mjs:readDedup/outputTrim/coldStartGuard)配套。",
+  "author": { "name": "Zoria-Lind" }
+}

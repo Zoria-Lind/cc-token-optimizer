@@ -1,0 +1,21 @@
+{
+  "_comment": "cc-token-optimizer 配置(可分发形式:换供应商/模型/触发规则只改本文件,不动代码)。pricing 单位元/百万 token,cheap/pro 两档分别填。高峰=北京时间周一至周五 9:00-12:00、14:00-18:00 且非 holidays;周末(含调休周末)与节假日全天空闲。holidays 按国务院通知维护(法定节假日+调休放出的工作日假)。models 填本机实际可用的模型名。upgrade 是复杂任务升 Pro 的启发式兜底参数。文件缺失或损坏时 hooks 与 mods 各自回退内置默认。defaultTier 定主力常驻档:cheap=启动恒 Flash+需要时手动升 Pro(升级触发器在人,不做模型自评——自指坑);pro=主力常驻 Pro、跑腿活派 subagent。",
+  "defaultTier": "cheap",
+  "pricing": {
+    "cheap": {
+      "idle": { "hit": 0.02, "miss": 1.0, "out": 4.0 },
+      "peak": { "hit": 0.04, "miss": 2.0, "out": 8.0 }
+    },
+    "pro": {
+      "idle": { "hit": 0.15, "miss": 4.5, "out": 13.5 },
+      "peak": { "hit": 0.3, "miss": 9.0, "out": 27.0 }
+    }
+  },
+  "holidays": ["2026-01-01", "2026-05-01", "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07"],
+  "models": { "cheap": "deepseek-flash[1m]", "pro": "deepseek-v4-pro[1m]" },
+  "upgrade": {
+    "minPromptChars": 120,
+    "keywords": ["设计", "架构", "重构", "方案", "决策", "算法", "实现", "代码", "函数", "接口", "模块", "编译", "报错", "调试", "脚本", "测试", "依赖", "design", "architecture", "refactor", "plan", "code", "implement", "function", "module", "debug", "bug", "fix", "test", "script", "commit", ".py", ".ts", ".tsx", ".js", ".mjs", ".jsx", ".ps1", ".sh", ".go", ".rs", ".java", ".cpp"],
+    "cooldownMin": 10
+  }
+}

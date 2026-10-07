@@ -1,0 +1,108 @@
+# cc-token-optimizer
+
+给 Claude Code 的 token 优化器。两层结构:
+
+## hooks/(settings-hook 层,管内容)
+
+`hooks/token-hook.mjs` —— 零依赖单文件,由 settings.json 的 hooks 驱动(stdin JSON → stdout JSON):
+
+| 模块 | 事件 | 作用 |
+|---|---|---|
+| readDedup | PreToolUse Read | 文件未变(mtime+size)且请求区间已在上下文中 → deny,防重复读出生(缓存安全,不动历史) |
+| recordRead | PostToolUse Read | 记录 mtime/size + 已读区间(合并区间;单会话 ≤200 文件;状态只留最近 5 会话) |
+| outputTrim | PostToolUse Bash/PowerShell | ≥5000 字符输出头尾采样(成功 1500+1500,错误 800+800,先重复行折叠再按折叠后长度判断),裁剪前原输出存档(不注入) |
+| coldStartGuard | SessionStart resume | 缓存已过期 → 注入一行提醒(上下文量 + 重缓存预估成本,建议 /clear) |
+| modelDirector | SessionStart / UserPromptSubmit / PreModelSwitch / PostModelSwitch | **档位"导演"**(口径由 config.json 的 `defaultTier` 决定,见下) |
+
+**modelDirector(混合双保险:模型自评纪律 + 启发式兜底 + 切换成本透明)**:
+
+主力常驻档由 `plugin/config.json` 的 `defaultTier` 决定,纪律文本随之整体换向:
+
+- **`cheap`(当前默认)**:启动恒 Flash,需要时由**用户本人** `/model` 升 Pro、下次启动自动回 Flash。**升级触发器必须在人** —— 若交给模型自评(让便宜档自己判断该不该升 Pro),它不知道自己便宜在哪,拿不准时不升级、埋头硬做,做砸了还没能力报告"我变差了"(2026-10-07 实测踩坑)。
+- **`pro`**:主力常驻 Pro、跑腿活派 subagent(少一次升降档操作,贵)。
+
+四个事件:
+
+- SessionStart:记录当前模型 + 注入档位纪律(主力档=cheap 时:基础档 → "拿不准就建议升 Pro",Pro → "任务完成后切回基础档";主力档=pro 时反之)
+- UserPromptSubmit 机械检测(coding 关键词/文件后缀 43 个 + 长提示阈值,见 config.json):命中 → ① 向模型注入**条件式**指令"若你不在 Pro 档,动手前先调用 Skill(coding-pro)"(每轮都给、不按记录档位拦截——回合级升档自动回落,state 档位可能滞后一拍);② 向用户显示 systemMessage(10 分钟冷却,记录档位已是 Pro 时不发)。**升档由机械检测驱动,不依赖模型自评** —— 自指坑的解法
+- 配套技能:`<配置目录>/skills/coding-pro/SKILL.md`(frontmatter `model:` 指向强档模型)—— 激活期间本回合跑 Pro、下一轮自动回落、不落盘。技能的 `model:` 头是 CC 里唯一"非用户触发"的模型切换机制(hook 切不了模型,官方文档确认;2026-10-07 实测跑通)
+- PreModelSwitch 切换成本透明:"切换将丢弃提示缓存,上下文约 80k,重缓存约 ¥0.36",提示任务边界再切
+- PostModelSwitch 记录新档位 + 注入对应提醒(切到 Pro:用完记得切回;切到基础档:拿不准就升)
+
+- 逃生:同文件连续 3 次拦截自动放行(防 deny 死锁,DSH 教训)
+- 铁律 fail-open:任何异常静默放行
+- 状态文件:`<CLAUDE_CONFIG_DIR>/token-optimizer/state.json`(跟随配置目录,未设时回退 `~/.claude`;2026-10-07 起不再固定写 C 盘 home)
+
+## plugin/(mods 层,管监视)
+
+AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 缓存命中率 / **成本 ¥(按当前档位计价,空闲/高峰 + Pro 标记)**;`/token-status` 命令看明细(当前模型档位、输入未命中/命中/输出三段成本拆分)。
+
+**配置(`plugin/config.json`,可分发形式)**:价目双档(cheap/pro,元/百万 token)、节假日表、模型名映射、升级启发式参数(关键词/长提示阈值/冷却)——换供应商(如 GLM)、换模型名只改 json 不动代码,缺失/坏 json 时内置 DeepSeek 默认兜底。DeepSeek 口径:高峰=北京时间周一至周五(非法定节假日)9:00-12:00、14:00-18:00,**周末(含调休周末)与节假日全天空闲**。
+
+**usage 折算(两种端点语义自动兼容)**:实测 DeepSeek Anthropic 兼容层的 `input_tokens` **不含缓存读**(cacheRead > input);Anthropic 官方的 `input_tokens` 含缓存读。按 miss 价部分 = `cacheRead > input ? input + cacheCreation : input - cacheRead`,命中部分 = cacheRead,输出含思考 token。
+
+**非 DeepSeek 供应商怎么配**(内置默认是 DeepSeek,其他供应商照此改 config.json):
+
+```json
+{
+  "pricing": {
+    "cheap": { "idle": { "hit": 0, "miss": 0, "out": 0 }, "peak": { "hit": 0, "miss": 0, "out": 0 } },
+    "pro":   { "idle": { "hit": 0, "miss": 0, "out": 0 }, "peak": { "hit": 0, "miss": 0, "out": 0 } }
+  },
+  "models": { "cheap": "你的便宜模型名", "pro": "你的强模型名" },
+  "upgrade": { "minPromptChars": 120, "keywords": ["你的业务词…"], "cooldownMin": 10 }
+}
+```
+
+- **没有高峰/空闲之分的供应商**(如多数国内模型):peak 填成与 idle 相同即可
+- **无缓存折扣或折扣口径不同的供应商**(如 Anthropic 官方是 cache-read 折扣、cache-write 溢价):hit 填 0 或按你的实际折扣填,成本行会退化为"未命中+输出"估算,量级仍近似
+- **模型名判定**:插件按 `models.pro` 精确匹配判定 Pro 档(通用);`includes('pro')` 只是 DeepSeek 命名的兜底启发式,填了 models 映射后任何供应商都正确
+- **hooks 安装路径**:settings.json 里 `args` 的绝对路径按你的安装位置改(README 示例用占位符)
+- 卖/分发时:用户只改这一个 json + settings.json 路径,代码零改动
+
+## tools/(手动工具)
+
+| 文件 | 作用 |
+|---|---|
+| `tool-gate.mjs` | 两档工具裁剪:改 `tiers.json` 名单后 `node tool-gate.mjs apply`(写前自动备份 settings.json,留 3 份),重启会话生效;`list` 只读对照,`enable <tool>` 召回 |
+| `stats.mjs` | 汇总 `<CLAUDE_CONFIG_DIR>/token-optimizer/state.json` 各会话拦截/裁剪/折叠计数与存档体积,估算累计省 token(`--json` 供脚本消费) |
+
+## 安装
+
+`~/.claude/settings.json`(路径按实际安装位置改):
+
+```json
+{
+  "env": { "CLAUDE_CODE_PLUGIN_DIRS": "…\\cc-token-optimizer\\plugin" },
+  "hooks": {
+    "PreToolUse":      [{ "matcher": "Read",              "hooks": [{ "type": "command", "command": "node", "args": ["<安装目录>/hooks/token-hook.mjs"], "timeout": 10 }] }],
+    "PostToolUse":     [{ "matcher": "Read|Bash|PowerShell", "hooks": [{ "type": "command", "command": "node", "args": ["<安装目录>/hooks/token-hook.mjs"], "timeout": 10 }] }],
+    "SessionStart":    [{ "matcher": "*",                "hooks": [{ "type": "command", "command": "node", "args": ["<安装目录>/hooks/token-hook.mjs"], "timeout": 10 }] }],
+    "UserPromptSubmit":[{ "matcher": "*",                "hooks": [{ "type": "command", "command": "node", "args": ["<安装目录>/hooks/token-hook.mjs"], "timeout": 10 }] }],
+    "PreModelSwitch":  [{ "matcher": "*",                "hooks": [{ "type": "command", "command": "node", "args": ["<安装目录>/hooks/token-hook.mjs"], "timeout": 10 }] }],
+    "PostModelSwitch": [{ "matcher": "*",                "hooks": [{ "type": "command", "command": "node", "args": ["<安装目录>/hooks/token-hook.mjs"], "timeout": 10 }] }]
+  },
+  "bashOutputMaxChars": 12000,
+  "promptCacheTtl": "1h",
+  "subagentPromptCacheTtl": "1h"
+}
+```
+
+## 设计红线
+
+只许在**出生点**处理(内容进入上下文之前),从不改写已存储的历史——改写历史 = 前缀字节变化 = 下次请求全价重读,必亏。harness 自身在压缩前会清旧工具输出,不与它抢活。当前构建 harness 已原生挡整文件重读(返回 "Wasted call — file unchanged"),readDedup 的增量只剩部分重叠区间与长跨度重读。
+
+## 验证
+
+```sh
+# hooks 层:管道测试(模拟三种事件载荷)
+node -e '…' | node hooks/token-hook.mjs
+# mods 层:静态校验
+claude plugin validate plugin
+```
+
+## 诚实边界
+
+- readDedup 按 mtime+size 判"未变"(不哈希内容;同秒改写同尺寸的极端情况会漏判为未变)
+- deny 拦截的代价是模型多一轮失败重试;靠 3 次逃生兜底
+- 悬浮条数值来自 turn.complete 聚合,压缩(/compact)后累计口径不重置
