@@ -1,5 +1,5 @@
 {
-  "_comment": "两档自选名单,可自行增删工具名:tier1_remove=确认不用的直接移除;tier2_hide=偶尔用的,移出调用范围但保留在此,node tool-gate.mjs enable <tool> 一条命令召回。ReportFindings 因 /code-review 技能依赖暂不列入(要禁就技能一起弃用)。改完跑:node tool-gate.mjs apply,然后重启会话生效。",
+  "_comment": "两档自选名单,可自行增删工具名:tier1_remove=确认不用的直接移除;tier2_hide=偶尔用的,移出调用范围但保留在此,node tool-gate.mjs enable <tool> 一条命令召回。ReportFindings 因 /code-review 技能依赖暂不列入(要禁就技能一起弃用)。改完跑:node tool-gate.mjs apply,然后重启会话生效。落地机制(2026-10-08 实测):写入 <配置目录>/agents/tool-gate.md 的 disallowedTools + settings 的 agent 键;该 agent 的 body 必须保持空,非空 prompt 会替换默认系统提示。",
   "tier1_remove": [
     "DesignSync",
     "NotebookEdit",
