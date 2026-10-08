@@ -14,7 +14,7 @@
 //                    便宜在哪,会漏升级、做砸了也报告不出来(2026-10-07 实测踩过)。
 // 铁律:任何异常静默放行(fail-open),绝不阻断工具。
 
-import { readFileSync, writeFileSync, statSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, statSync, mkdirSync, readdirSync, unlinkSync, rmdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -31,6 +31,9 @@ const ERR_TAIL = 800 // 错误输出:保留尾部字符数
 const MAX_DENIES = 3 // readDedup 逃生:同文件连续拦截超过该次数放行(DSH 同款防死锁)
 const SESSION_KEEP = 5 // 状态文件只保留最近 N 个会话
 const MAX_FILES_PER_SESSION = 200 // 单会话记录文件数上限(超出丢最旧)
+const AGENT_KEEP = 8 // 每会话的子 agent 读去重桶上限(_at LRU 保留最近 N 个)
+const CODING_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'] // 改动类工具:PreToolUse 只用于给升级提醒落 coding 流时间戳
+const STICKY_DEFAULT_MIN = 30 // 升档粘性窗口默认值(分钟):改过代码后的续接轮都提醒升档
 
 // ---- 配置:优先读 ../plugin/config.json(可分发:用户自填价目/模型名/升级规则),失败回退内置默认 ----
 const CONFIG_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'config.json')
@@ -71,10 +74,40 @@ function loadState() {
   try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')) } catch { return {} }
 }
 function saveState(s) {
+  const tmp = `${STATE_FILE}.tmp-${process.pid}`
   try {
     mkdirSync(STATE_DIR, { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify(s))
-  } catch { /* 状态写失败不致命 */ }
+    writeFileSync(tmp, JSON.stringify(s)) // 原子替换:防并发读到写一半的 JSON(读失败会把全量状态归零)
+    renameSync(tmp, STATE_FILE)
+  } catch { try { unlinkSync(tmp) } catch { /* 状态写失败不致命 */ } }
+}
+// ---- 状态文件跨进程锁(2026-10-08):多会话/多 hook 进程并发 read-modify-write 会互相覆盖丢更新 ----
+// mkdir 原子性做锁;建锁失败/等锁超时一律照常干活(fail-open,锁绝不成为故障点);崩溃遗留的陈旧锁按 mtime 强抢。
+const LOCK_DIR = `${STATE_FILE}.lock`
+const LOCK_WAIT_MS = 800
+const LOCK_STALE_MS = 2000
+const sleepMs = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch { } }
+function withStateLock(fn) {
+  let held = false
+  try { mkdirSync(STATE_DIR, { recursive: true }) } catch { }
+  const start = Date.now()
+  for (;;) {
+    try { mkdirSync(LOCK_DIR); held = true; break } catch (err) {
+      if (err?.code !== 'EEXIST') break
+      try {
+        if (Date.now() - statSync(LOCK_DIR).mtimeMs > LOCK_STALE_MS) { rmdirSync(LOCK_DIR); continue }
+      } catch { }
+      if (Date.now() - start > LOCK_WAIT_MS) break
+      sleepMs(25)
+    }
+  }
+  try { return fn() } finally { if (held) { try { rmdirSync(LOCK_DIR) } catch { } } }
+}
+// 读去重的上下文键:子 agent 上下文独立于父会话(2026-10-08 实测:两者共用 session_id/transcript_path,
+// 载荷里只有 agent_id 可区分)—— 各自成桶,互不顶替,防"内容不在却报已在"的静默致盲。
+function ctxKey(e) {
+  const s = e.session_id ?? 'default'
+  return e.agent_id ? `${s}::agent:${e.agent_id}` : s
 }
 // 会话级统计条目:拦截/裁剪/折叠计数(供 /token-status 或人工查 state.json)
 function statEntry(state, session) {
@@ -120,68 +153,113 @@ function wantedRange(input) {
 }
 
 // ---- readDedup:文件未变且区间已覆盖 → deny ----
+// ⚠ 记录按 ctxKey 分桶(主会话 / 各子 agent 独立);只信任 v===2 格式的记录 —— 修复前被跨上下文
+//    污染写入的旧记录无 v 标记,自动失效(最坏多读一次,方向是 fail-open)。
 function readDedup(e, out) {
   const path = e.tool_input?.file_path
   if (typeof path !== 'string' || e.tool_input?.pages !== undefined) return
   const abs = resolve(path)
   const st = fileStat(abs)
   if (!st) return
+  const ctx = ctxKey(e)
   const session = e.session_id ?? 'default'
-  const state = loadState()
-  const sess = state[session] ?? {}
-  const rec = sess[abs]
   const want = wantedRange(e.tool_input)
-  const strikes = state._strikes?.[session]?.[abs] ?? 0
-  const unchanged = rec && rec.mtimeMs === st.mtimeMs && rec.size === st.size
-  if (unchanged && rec.ranges) {
-    const covered = rec.ranges.some(([s, t]) => s <= want[0] && t >= want[1])
-    if (covered && strikes < MAX_DENIES) {
-      state._strikes = state._strikes ?? {}
-      state._strikes[session] = state._strikes[session] ?? {}
-      state._strikes[session][abs] = strikes + 1
-      statEntry(state, session).denies += 1
-      saveState(state)
-      out.hookSpecificOutput = {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason:
-          `[cc-token-optimizer] ${path} 自上次读取后未变化,区间 ${want[0]}-${want[1]} 已在上下文中,无需重读。` +
-          `连续 ${MAX_DENIES} 次拦截将自动放行;强制重读可修改文件或删除状态文件中该条目。`,
+  withStateLock(() => {
+    const state = loadState()
+    const rec = state[ctx]?.[abs]
+    const strikes = state._strikes?.[ctx]?.[abs] ?? 0
+    const unchanged = rec && rec.v === 2 && rec.mtimeMs === st.mtimeMs && rec.size === st.size
+    if (unchanged && rec.ranges) {
+      const covered = rec.ranges.some(([s, t]) => s <= want[0] && t >= want[1])
+      if (covered && strikes < MAX_DENIES) {
+        state._strikes = state._strikes ?? {}
+        state._strikes[ctx] = state._strikes[ctx] ?? {}
+        state._strikes[ctx][abs] = strikes + 1
+        if (state[ctx]) state[ctx]._at = Date.now()
+        statEntry(state, session).denies += 1
+        saveState(state)
+        out.hookSpecificOutput = {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            `[cc-token-optimizer] ${path} 自上次读取后未变化,区间 ${want[0]}-${want[1]} 已在上下文中,无需重读。` +
+            `连续 ${MAX_DENIES} 次拦截将自动放行;强制重读可修改文件或删除状态文件中该条目。`,
+        }
+        return
       }
-      return
     }
-  }
-  if (strikes > 0) {
-    state._strikes[session][abs] = 0 // 放行则清连续拦截计数
-    saveState(state)
-  }
+    if (strikes > 0) {
+      state._strikes[ctx][abs] = 0 // 放行则清连续拦截计数
+      if (state[ctx]) state[ctx]._at = Date.now()
+      saveState(state)
+    }
+  })
 }
 
-// ---- recordRead:成功读后记录 ----
+// ---- recordRead:成功读后记录(按上下文键 ctxKey 分桶:主会话 / 各子 agent 各一桶) ----
+function pruneState(state) {
+  // 按活跃时间(_at)LRU 淘汰:主会话留最近 SESSION_KEEP 个;子 agent 桶随父会话淘汰 + 每会话限
+  // AGENT_KEEP 个(_at LRU);被淘汰键的 _strikes 一并清(_stats 是用户数据,不清)。
+  // 用 _at 而非插入序:长期挂着的活跃主会话不该被一堆短命会话挤掉。
+  const keys = Object.keys(state).filter((k) => k !== '_strikes' && k !== '_stats')
+  const mains = keys.filter((k) => !k.includes('::agent:'))
+  const byAge = [...mains].sort((a, b) => (state[b]?._at ?? 0) - (state[a]?._at ?? 0))
+  const dropped = new Set(byAge.slice(SESSION_KEEP))
+  for (const m of dropped) delete state[m]
+  const byMain = {}
+  for (const k of keys) {
+    if (!state[k]) continue
+    if (k.includes('::agent:')) {
+      const m = k.slice(0, k.indexOf('::agent:'))
+      if (dropped.has(m)) { delete state[k]; continue }
+      ;(byMain[m] ??= []).push(k)
+    }
+  }
+  for (const m of Object.keys(byMain)) {
+    const list = byMain[m].sort((a, b) => (state[b]?._at ?? 0) - (state[a]?._at ?? 0))
+    for (const k of list.slice(AGENT_KEEP)) delete state[k]
+  }
+  if (state._strikes) for (const k of Object.keys(state._strikes)) if (!state[k]) delete state._strikes[k]
+}
 function recordRead(e) {
   const path = e.tool_input?.file_path
   if (typeof path !== 'string') return
   const abs = resolve(path)
   const st = fileStat(abs)
   if (!st) return
-  const session = e.session_id ?? 'default'
-  const state = loadState()
-  const keys = Object.keys(state).filter((k) => k !== '_strikes' && k !== '_stats')
-  if (keys.length > SESSION_KEEP) {
-    for (const k of keys.slice(0, keys.length - SESSION_KEEP)) delete state[k]
-  }
-  const sess = state[session] ?? {}
-  const rec = sess[abs]
-  const range = wantedRange(e.tool_input)
-  const sameFile = rec && rec.mtimeMs === st.mtimeMs && rec.size === st.size
-  const ranges = sameFile ? mergeRanges(rec.ranges ?? [], range) : [range]
-  if (!sess[abs]) {
-    const paths = Object.keys(sess)
-    if (paths.length >= MAX_FILES_PER_SESSION) delete sess[paths[0]]
-  }
-  sess[abs] = { mtimeMs: st.mtimeMs, size: st.size, ranges, at: Date.now() }
-  state[session] = sess
-  saveState(state)
+  const ctx = ctxKey(e)
+  withStateLock(() => {
+    const state = loadState()
+    const sess = state[ctx] ?? {}
+    const rec = sess[abs]
+    const range = wantedRange(e.tool_input)
+    const sameFile = rec && rec.v === 2 && rec.mtimeMs === st.mtimeMs && rec.size === st.size // 只并 v2 区间:旧记录可能带跨上下文污染区间,并进来等于洗白
+    const ranges = sameFile ? mergeRanges(rec.ranges ?? [], range) : [range]
+    if (!sess[abs]) {
+      const paths = Object.keys(sess).filter((k) => !k.startsWith('_')) // _model/_at 等元字段不算文件记录
+      if (paths.length >= MAX_FILES_PER_SESSION) delete sess[paths[0]]
+    }
+    sess[abs] = { mtimeMs: st.mtimeMs, size: st.size, ranges, v: 2, at: Date.now() }
+    sess._at = Date.now()
+    state[ctx] = sess
+    pruneState(state) // 先落 _at 再修剪:活跃桶不会被自己剪掉
+    saveState(state)
+  })
+}
+
+// ---- markCodingActivity:改动类工具(Edit/Write/MultiEdit/NotebookEdit)的 PreToolUse ----
+// 只落一个"最近改过代码"时间戳,供升级提醒的粘性窗口用;不产出任何输出。
+// (2026-10-08:回合级升档会自动回落,靠当轮文本猜"是否在 coding 流"漏短句续接——改过代码是更硬的信号)
+function markCodingActivity(e) {
+  const session = e.session_id ?? 'default' // 记父会话:子 agent 的改动也算这条 coding 流
+  withStateLock(() => {
+    const state = loadState()
+    const sess = state[session] ?? {}
+    sess._codingAt = Date.now()
+    sess._at = Date.now()
+    state[session] = sess
+    saveState(state)
+  })
 }
 
 // ---- outputTrim:重复行折叠 + 超长输出头尾采样 ----
@@ -241,7 +319,7 @@ function trimOutput(e, out) {
     }
   } else if (typeof resp === 'object' && resp !== null) {
     const o = { ...resp }
-    let changed = false
+    const touched = []
     for (const k of ['stdout', 'stderr']) {
       const v = o[k]
       if (typeof v !== 'string') continue
@@ -250,21 +328,22 @@ function trimOutput(e, out) {
       o[k] = r.text
       collapsed += r.collapsed
       trimmedChars += r.trimmedChars
-      changed = true
+      touched.push(k)
     }
-    if (changed) {
+    if (touched.length) {
       const archived = archiveOriginal(session, e.tool_name, JSON.stringify(resp))
-      const target = typeof o.stdout === 'string' ? 'stdout' : 'stderr'
-      o[target] += archived ? `\n[cc-token-optimizer: 完整原输出已存档(未注入上下文):${archived}]` : ''
+      o[touched[0]] += archived ? `\n[cc-token-optimizer: 完整原输出已存档(未注入上下文):${archived}]` : ''
       out.hookSpecificOutput = { hookEventName: 'PostToolUse', updatedToolOutput: o }
     }
   }
   if (collapsed > 0 || trimmedChars > 0) {
-    const state = loadState()
-    const s = statEntry(state, session)
-    if (trimmedChars > 0) { s.trims += 1; s.trimmedChars += trimmedChars }
-    if (collapsed > 0) s.collapsedLines += collapsed
-    saveState(state)
+    withStateLock(() => {
+      const state = loadState()
+      const s = statEntry(state, session)
+      if (trimmedChars > 0) { s.trims += 1; s.trimmedChars += trimmedChars }
+      if (collapsed > 0) s.collapsedLines += collapsed
+      saveState(state)
+    })
   }
 }
 
@@ -285,18 +364,21 @@ function coldStartGuard(e) {
 function sessionModel(state, session) {
   return state[session]?._model ?? null
 }
-function setSessionModel(state, session, model) {
-  const sess = state[session] ?? {}
-  sess._model = model
-  state[session] = sess
-  saveState(state)
+function setSessionModel(session, model) {
+  withStateLock(() => {
+    const state = loadState()
+    const sess = state[session] ?? {}
+    sess._model = model
+    sess._at = Date.now()
+    state[session] = sess
+    saveState(state)
+  })
 }
 // SessionStart:记录当前模型 + 注入档位纪律(模型自评是主判定:拿不准就建议升级)
 function modelPolicy(e) {
   const model = e.model
   if (typeof model !== 'string' || model === '') return
-  const state = loadState()
-  setSessionModel(state, e.session_id ?? 'default', model)
+  setSessionModel(e.session_id ?? 'default', model)
   if (isProModel(model)) {
     console.log(`[cc-token-optimizer] 当前 Pro 档(输出 ${CFG.pricing.pro.idle.out} 元/M)。` + stayAdvice)
   } else {
@@ -314,23 +396,31 @@ function upgradeHeuristic(e, out) {
   const up = CFG.upgrade
   const lenOk = prompt.length >= (up.minPromptChars ?? 120)
   const kwHit = (up.keywords ?? []).some((k) => prompt.toLowerCase().includes(String(k).toLowerCase()))
-  if (!lenOk && !kwHit) return
+  // 粘性窗口:近期改过代码(Edit/Write 的 PreToolUse 落了 _codingAt)→ 不管当轮文本长短都提醒,
+  // 覆盖"继续/修吧"这类短句续接(2026-10-08 实测漏档)
+  const codingFlow = Date.now() - (state[session]?._codingAt ?? 0) < (up.stickyMin ?? STICKY_DEFAULT_MIN) * 60_000
+  if (!lenOk && !kwHit && !codingFlow) return
   // 给模型的指令:条件式、每轮都给、不带冷却。
   // 不按 state 记录的档位拦截 —— 回合级升档会自动回落,state 里的 _model 可能滞后一拍(还停在 pro),
   // 按它拦截会漏掉"回落后的第一条 coding"。档位判定交给模型读自己每轮的系统提示(事实性核对,非评估)。
   out.hookSpecificOutput = {
     hookEventName: 'UserPromptSubmit',
     additionalContext:
-      `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : '长提示'}:若你当前不在 Pro 档,动手前先调用 Skill 工具(coding-pro)` +
+      `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : lenOk ? '长提示' : ' coding 流(近期有代码改动)'}:若你当前不在 Pro 档,动手前先调用 Skill 工具(coding-pro)` +
       `让本回合以 Pro 档执行(回合级、自动回落;改一行/加注释这类小事可不调用);已在 Pro 档则忽略本条。`,
   }
-  // 给用户的提示:带冷却(同会话 10 分钟内只提示一次);记录档位已是 Pro 时不发(避免误导)
+  // 给用户的提示:只对关键词/长提示发(粘性窗口下的短句续接只提醒模型、不打扰用户),
+  // 带冷却(同会话 10 分钟内只提示一次);记录档位已是 Pro 时不发(避免误导)
   const last = state[session]?._upgradeSugAt ?? 0
-  if (!(model && isProModel(model)) && Date.now() - last >= (up.cooldownMin ?? 10) * 60_000) {
-    const sess = state[session] ?? {}
-    sess._upgradeSugAt = Date.now()
-    state[session] = sess
-    saveState(state)
+  if ((kwHit || lenOk) && !(model && isProModel(model)) && Date.now() - last >= (up.cooldownMin ?? 10) * 60_000) {
+    withStateLock(() => {
+      const s2 = loadState()
+      const sess = s2[session] ?? {}
+      sess._upgradeSugAt = Date.now()
+      sess._at = Date.now()
+      s2[session] = sess
+      saveState(s2)
+    })
     out.systemMessage =
       `[cc-token-optimizer] 本条判为${kwHit ? 'coding 任务' : '长任务'},本回合按 Pro 档执行(下一轮自动回 Flash)。` +
       `想让整段会话都用 Pro 就 /model ${CFG.models.pro};否则无需操作。`
@@ -355,8 +445,7 @@ function preModelSwitch(e) {
 function postModelSwitch(e) {
   const to = e.to_model
   if (typeof to !== 'string') return
-  const state = loadState()
-  setSessionModel(state, e.session_id ?? 'default', to)
+  setSessionModel(e.session_id ?? 'default', to)
   if (isProModel(to)) {
     console.log(
       `[cc-token-optimizer] 已切 Pro 档(输出 ${CFG.pricing.pro.idle.out} 元/M,` +
@@ -379,6 +468,7 @@ function main() {
     else if (ev === 'PreModelSwitch') preModelSwitch(e)
     else if (ev === 'PostModelSwitch') postModelSwitch(e)
     else if (ev === 'PreToolUse' && e.tool_name === 'Read') readDedup(e, out)
+    else if (ev === 'PreToolUse' && CODING_TOOLS.includes(e.tool_name)) markCodingActivity(e)
     else if (ev === 'PostToolUse' && e.tool_name === 'Read') recordRead(e)
     else if (ev === 'PostToolUse' && (e.tool_name === 'Bash' || e.tool_name === 'PowerShell')) trimOutput(e, out)
     else { // 形态判定兜底(hook_event_name 缺失的环境)
@@ -386,6 +476,7 @@ function main() {
       const isPre = e.tool_name !== undefined && e.tool_response === undefined
       const isPost = e.tool_name !== undefined && e.tool_response !== undefined
       if (isPre && e.tool_name === 'Read') readDedup(e, out)
+      else if (isPre && CODING_TOOLS.includes(e.tool_name)) markCodingActivity(e)
       else if (isPost && e.tool_name === 'Read') recordRead(e)
       else if (isPost && (e.tool_name === 'Bash' || e.tool_name === 'PowerShell')) trimOutput(e, out)
       else if (isSessionStart) coldStartGuard(e)
