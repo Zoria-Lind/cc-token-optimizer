@@ -1,7 +1,7 @@
 {
   "name": "cc-token-optimizer",
   "version": "0.2.2",
-  "description": "Claude Code 会话 token 监视与省钱档位导演:readDedup 读去重、outputTrim 输出裁剪、coldStartGuard 冷启动守卫、modelDirector 档位提醒,外加成本/缓存命中率悬浮条与 /token-status。装完即用,无需配置。",
+  "description": "Claude Code token & cost optimizer — read de-dup, output trimming, cold-start guard, model-tier nudges, plus a live cost / cache-hit bar and /token-status. 中文:会话 token 监视与省钱档位导演,装完即用(默认按 DeepSeek 价目与模型名,换供应商改 config.json)。",
   "author": { "name": "Zoria-Lind" },
   "types": "./types/index.d.ts"
 }
