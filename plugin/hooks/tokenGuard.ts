@@ -44,7 +44,11 @@ type Cfg = {
   pricing: { cheap: PriceTier; pro: PriceTier }
   holidays: string[]
   models: { cheap: string; pro: string }
-  upgrade: { minPromptChars: number; keywords: string[]; cooldownMin: number; stickyMin: number }
+  /** 金额前缀(¥ / $ / 元 等)。换供应商时改这里,悬浮条、/token-status、切换成本估算都跟着变。 */
+  currency: string
+  /** skillName 非空 → 升档建议让模型调用该技能(技能的 `model:` 头是 CC 里唯一非用户触发的切档通路);
+   *  留空 → 退化为通用措辞(建议用户自己 /model)。 */
+  upgrade: { minPromptChars: number; keywords: string[]; cooldownMin: number; stickyMin: number; skillName: string }
 }
 const DEFAULT_CONFIG: Cfg = {
   defaultTier: 'pro',
@@ -54,11 +58,14 @@ const DEFAULT_CONFIG: Cfg = {
   },
   holidays: ['2026-01-01', '2026-05-01', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'],
   models: { cheap: 'deepseek-v4-flash', pro: 'deepseek-v4-pro[1m]' },
+  currency: '¥',
   upgrade: {
     minPromptChars: 120,
     keywords: ['设计', '架构', '重构', '方案', '决策', '算法', 'design', 'architecture', 'refactor', 'plan'],
     cooldownMin: 10,
     stickyMin: STICKY_DEFAULT_MIN,
+    // 内置默认留空 = 通用措辞(任何供应商都说得通);插件自带的 config.json 填 'coding-pro'。
+    skillName: '',
   },
 }
 let cfgCache: Cfg | null = null
@@ -375,13 +382,17 @@ async function setSessionModel($: any, session: string, model: string): Promise<
 }
 function tierAdvice(cfg: Cfg): { stay: string; up: string } {
   const isProDefault = cfg.defaultTier !== 'cheap'
+  const skill = cfg.upgrade.skillName
+  const upCheap = skill
+    ? `涉及 coding(写/改代码、调试、重构、脚本、报错)时,先调用 Skill 工具(${skill}) 让本回合跑 Pro 档(回合级、自动回落),再动手;其他复杂任务可在动手前建议用户 /model ${cfg.models.pro}。`
+    : `涉及 coding(写/改代码、调试、重构、脚本、报错)时,建议用户先 /model ${cfg.models.pro} 升 Pro 档再动手;其他复杂任务同理。`
   return {
     stay: isProDefault
       ? '跑腿活(搜索/批量读取/机械改动)派 subagent,它们走基础档;主会话不必为省钱降档。'
       : `任务完成后记得切回基础档:/model ${cfg.models.cheap}。`,
     up: isProDefault
       ? `判断力吃紧(设计/架构/复杂调试)就切回主力:/model ${cfg.models.pro}。`
-      : `涉及 coding(写/改代码、调试、重构、脚本、报错)时,先调用 Skill 工具(coding-pro) 让本回合跑 Pro 档(回合级、自动回落),再动手;其他复杂任务可在动手前建议用户 /model ${cfg.models.pro}。`,
+      : upCheap,
   }
 }
 // SessionStart:记模型 + 档位纪律注入
@@ -391,8 +402,8 @@ async function modelPolicy($: any, e: any, cfg: Cfg): Promise<string | null> {
   await setSessionModel($, await sessionId($, e), model)
   const adv = tierAdvice(cfg)
   return isProModel(cfg, model)
-    ? `[cc-token-optimizer] 当前 Pro 档(输出 ${cfg.pricing.pro.idle.out} 元/M)。` + adv.stay
-    : `[cc-token-optimizer] 当前基础档(输出 ${cfg.pricing.cheap.idle.out} 元/M)。` + adv.up
+    ? `[cc-token-optimizer] 当前 Pro 档(输出 ${cfg.currency}${cfg.pricing.pro.idle.out}/M)。` + adv.stay
+    : `[cc-token-optimizer] 当前基础档(输出 ${cfg.currency}${cfg.pricing.cheap.idle.out}/M)。` + adv.up
 }
 // UserPromptSubmit:机械检测 → 驱动回合级升档。返回 { additionalContext, toast? }
 async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalContext: string; toast?: string } | null> {
@@ -407,9 +418,12 @@ async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalC
   if (!lenOk && !kwHit && !codingFlow) return null
   const model = state[session]?._model ?? null
   // 给模型的指令:条件式、每轮都给、不带冷却(档位判定交给模型读自己每轮的系统提示,不按 state 拦)
+  const skill = cfg.upgrade.skillName
   const additionalContext =
-    `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : lenOk ? '长提示' : ' coding 流(近期有代码改动)'}:若你当前不在 Pro 档,动手前先调用 Skill 工具(coding-pro)` +
-    `让本回合以 Pro 档执行(回合级、自动回落;改一行/加注释这类小事可不调用);已在 Pro 档则忽略本条。`
+    `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : lenOk ? '长提示' : ' coding 流(近期有代码改动)'}:` +
+    (skill
+      ? `若你当前不在 Pro 档,动手前先调用 Skill 工具(${skill})让本回合以 Pro 档执行(回合级、自动回落;改一行/加注释这类小事可不调用);已在 Pro 档则忽略本条。`
+      : `若你当前不在 Pro 档,动手前建议用户 /model ${cfg.models.pro} 升档再动手(改一行/加注释这类小事可不升);已在 Pro 档则忽略本条。`)
   // 给用户的提示:只对关键词/长提示发;带冷却;记录档位已是 Pro 时不发(避免误导)
   const last = state[session]?._upgradeSugAt ?? 0
   if ((kwHit || lenOk) && !isProModel(cfg, model) && Date.now() - last >= (up.cooldownMin ?? 10) * 60_000) {
@@ -421,9 +435,10 @@ async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalC
     await writeState($, s2)
     return {
       additionalContext,
-      toast:
-        `[cc-token-optimizer] 本条判为${kwHit ? 'coding 任务' : '长任务'},本回合按 Pro 档执行(下一轮自动回 Flash)。` +
-        `想让整段会话都用 Pro 就 /model ${cfg.models.pro};否则无需操作。`,
+      toast: skill
+        ? `[cc-token-optimizer] 本条判为${kwHit ? 'coding 任务' : '长任务'},本回合按 Pro 档执行(下一轮自动回 ${cfg.models.cheap})。` +
+          `想让整段会话都用 Pro 就 /model ${cfg.models.pro};否则无需操作。`
+        : `[cc-token-optimizer] 本条判为${kwHit ? 'coding 任务' : '长任务'}。未配升级技能,请自行 /model ${cfg.models.pro} 切强档(下次启动自动回 ${cfg.models.cheap})。`,
     }
   }
   return { additionalContext }
@@ -436,7 +451,7 @@ function preModelSwitch(cfg: Cfg, e: any): string | null {
   const ctx = typeof e.context_tokens === 'number' ? Math.round(e.context_tokens / 1000) : null
   const tier = isProModel(cfg, to) ? 'pro' : 'cheap'
   const miss = cfg.pricing[tier].idle.miss
-  const est = ctx !== null ? `,重缓存约 ¥${((ctx * 1000 * miss) / 1_000_000).toFixed(2)}(空闲价)` : ''
+  const est = ctx !== null ? `,重缓存约 ${cfg.currency}${((ctx * 1000 * miss) / 1_000_000).toFixed(2)}(空闲价)` : ''
   return (
     `[cc-token-optimizer] 切换 ${from ?? '?'} → ${to} 将丢弃当前提示缓存` +
     (ctx !== null ? `:上下文约 ${ctx}k token` : '') + est +
@@ -452,11 +467,11 @@ async function postModelSwitch($: any, e: any, cfg: Cfg): Promise<{ additionalCo
   const pro = isProModel(cfg, to)
   return pro
     ? {
-      additionalContext: `[cc-token-optimizer] 已切 Pro 档(输出 ${cfg.pricing.pro.idle.out} 元/M,${(cfg.pricing.pro.idle.out / cfg.pricing.cheap.idle.out).toFixed(1)}x 基础档)。` + adv.stay,
+      additionalContext: `[cc-token-optimizer] 已切 Pro 档(输出 ${cfg.currency}${cfg.pricing.pro.idle.out}/M,${(cfg.pricing.pro.idle.out / cfg.pricing.cheap.idle.out).toFixed(1)}x 基础档)。` + adv.stay,
       toast: `[cc-token-optimizer] 已切 Pro 档 · ${adv.stay}`,
     }
     : {
-      additionalContext: `[cc-token-optimizer] 已切基础档(输出 ${cfg.pricing.cheap.idle.out} 元/M)。` + adv.up,
+      additionalContext: `[cc-token-optimizer] 已切基础档(输出 ${cfg.currency}${cfg.pricing.cheap.idle.out}/M)。` + adv.up,
       toast: `[cc-token-optimizer] 已切基础档 · ${adv.up}`,
     }
 }
@@ -468,6 +483,9 @@ async function toast($: any, text: string | undefined): Promise<void> {
 
 // ============================ 注册 ============================
 export const register: Register = (on) => {
+  // 每次插件加载重读 config.json(loadConfig 会读一次缓存住):热重载/新会话改完配置即生效,
+  // 引擎级测试里各用例也不会串用上一个用例的配置。
+  cfgCache = null
   // SessionStart:coldStartGuard + modelPolicy 合并注入(都走 additionalContext)
   on('classic.SessionStart', async ($, e, next) => {
     try {

@@ -31,8 +31,8 @@ Claude Code 2.1.275+. It asks whether to add the marketplace (`y`), then for a s
 
 ### Honest edges
 
-- **Pricing and model names default to DeepSeek** (dual peak / off-peak tiers). For another provider, edit `config.json` — pricing, model mapping and the upgrade heuristic all live there, with no code changes.
-- **modelDirector assumes this setup**: its upgrade suggestion points at a `coding-pro` skill that ships outside the plugin. On a stock install you may prefer `"defaultTier": "pro"` or to blank out the heuristic keywords.
+- **Pricing, model names and the currency symbol default to DeepSeek** (dual peak / off-peak tiers, `currency: "¥"`). For another provider, edit `config.json` — pricing, model mapping, currency and the upgrade heuristic all live there, with no code changes.
+- **modelDirector's upgrade nudge names a skill** (`coding-pro`, the author's own) — a skill's `model:` header is the only way a plugin can switch tiers without you typing `/model`. Blank `upgrade.skillName` in `config.json` and the advice degrades to a plain "switch with `/model`".
 - **readDedup** compares mtime + size rather than content hashes (a same-second, same-size rewrite is missed), and recent Claude Code builds already answer whole-file re-reads natively — the remaining value is partial-overlap merging and long-span re-reads.
 - A denied read costs one failed round while the model retries; hence the 3-strike escape hatch.
 - Status-bar figures are aggregated from `turn.complete`, and `/compact` does not reset the running totals.
@@ -97,13 +97,16 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
     "pro":   { "idle": { "hit": 0, "miss": 0, "out": 0 }, "peak": { "hit": 0, "miss": 0, "out": 0 } }
   },
   "models": { "cheap": "你的便宜模型名", "pro": "你的强模型名" },
-  "upgrade": { "minPromptChars": 120, "keywords": ["你的业务词…"], "cooldownMin": 10 }
+  "currency": "$",
+  "upgrade": { "minPromptChars": 120, "keywords": ["你的业务词…"], "cooldownMin": 10, "skillName": "" }
 }
 ```
 
 - **没有高峰/空闲之分的供应商**(如多数国内模型):peak 填成与 idle 相同即可
 - **无缓存折扣或折扣口径不同的供应商**(如 Anthropic 官方是 cache-read 折扣、cache-write 溢价):hit 填 0 或按你的实际折扣填,成本行会退化为"未命中+输出"估算,量级仍近似
 - **模型名判定**:插件按 `models.pro` 精确匹配判定 Pro 档(通用);`includes('pro')` 只是 DeepSeek 命名的兜底启发式,填了 models 映射后任何供应商都正确
+- **货币符号**:`currency` 是金额前缀(默认 `¥`),悬浮条、`/token-status`、切换成本估算都用它 —— 用美元就填 `"$"`
+- **升档建议里的技能名**:`upgrade.skillName` 填你自己的"强档技能"(该技能 SKILL.md 的 `model:` 头负责切档;这是 CC 里唯一非用户触发的切换通路);**留空**则升档建议退化为"请用户 /model 切换"的通用说法 —— 没有这类技能的用户请留空(本仓库自带值是作者自用的 `coding-pro`)
 - **hooks 安装路径**:settings.json 里 `args` 的绝对路径按你的安装位置改(README 示例用占位符)
 - 卖/分发时:用户只改这一个 json + settings.json 路径,代码零改动
 

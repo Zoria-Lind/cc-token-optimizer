@@ -24,6 +24,8 @@ const DEFAULT_CONFIG: {
   pricing: { cheap: PriceTier; pro: PriceTier }
   holidays: string[]
   models: { cheap: string; pro: string }
+  /** 金额前缀(¥ / $ / 元 等),与 tokenGuard 层同名同义(两处各自读同一个 config.json)。 */
+  currency: string
   upgrade: { minPromptChars: number; keywords: string[]; cooldownMin: number }
 } = {
   pricing: {
@@ -32,6 +34,7 @@ const DEFAULT_CONFIG: {
   },
   holidays: ['2026-01-01', '2026-05-01', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'],
   models: { cheap: 'deepseek-v4-flash', pro: 'deepseek-v4-pro[1m]' },
+  currency: '¥',
   upgrade: { minPromptChars: 120, keywords: ['设计', '架构', '重构', '方案', '决策', '算法', 'design', 'architecture', 'refactor', 'plan'], cooldownMin: 10 },
 }
 // 读取一次后缓存(含失败回退,避免每轮渲染都读盘);mods 层禁 node 内置模块,走官方 $.fs.read
@@ -152,6 +155,7 @@ const saveTotals = async ($: any, T: UsageTotals): Promise<void> => {
 }
 
 export const register: Register = (on, options) => {
+  configCache = null // 每次加载重读 config.json(见 loadConfig),热重载后改配置即生效
   // settings-hook 层六模块(readDedup/outputTrim/coldStartGuard/modelDirector 等)
   // 由 tokenGuard.ts 注册 —— 随插件分发,不再依赖用户手工往 settings.json 里配。
   registerGuard(on, options)
@@ -246,7 +250,7 @@ export const register: Register = (on, options) => {
       <Box>
         <Text dimColor>
           [opt] {T.turns}轮 · ctx {ctxText || '?'} · 输入 {fmt(T.input)} + 缓存读 {fmt(T.cacheRead)} / 写 {fmt(T.cacheCreation)} · 输出 {fmt(T.output)}
-          {hit !== null ? ` · 命中 ${hit.toFixed(1)}%` : ''} · ¥{cost.toFixed(2)}{peak ? ' 高峰' : ''}{pro ? '·Pro' : '·基础档'}{reloadMark}
+          {hit !== null ? ` · 命中 ${hit.toFixed(1)}%` : ''} · {cfg.currency}{cost.toFixed(2)}{peak ? ' 高峰' : ''}{pro ? '·Pro' : '·基础档'}{reloadMark}
         </Text>
         {compactWarn !== '' && <Text>{compactWarn}</Text>}
       </Box>
@@ -283,11 +287,11 @@ export const register: Register = (on, options) => {
         `- 轮次: ${T.turns}${T.turnsNoUsage > 0 || T.subagentTurns > 0 ? `(另有 usage 缺失 ${T.turnsNoUsage} 轮、子代理 ${T.subagentTurns} 轮,未计价)` : ''}`,
         `- 输入 ${fmt(T.input)} / 缓存读 ${fmt(T.cacheRead)} / 缓存写 ${fmt(T.cacheCreation)} / 输出 ${fmt(T.output)}`,
         `- 缓存命中率: ${hit !== null ? `${hit.toFixed(1)}%` : '暂无数据'}`,
-        `- 成本(¥,${pro ? 'Pro' : '基础'}档): ¥${cost.toFixed(3)}(${peak ? '高峰' : '空闲'}价) · 输入未命中 ¥${((uncached * pricing[peak ? 'peak' : 'idle'].miss) / 1_000_000).toFixed(3)} / 命中 ¥${((T.cacheRead * pricing[peak ? 'peak' : 'idle'].hit) / 1_000_000).toFixed(3)} / 输出 ¥${((T.output * pricing[peak ? 'peak' : 'idle'].out) / 1_000_000).toFixed(3)}`,
+        `- 成本(${cfg.currency},${pro ? 'Pro' : '基础'}档): ${cfg.currency}${cost.toFixed(3)}(${peak ? '高峰' : '空闲'}价) · 输入未命中 ${cfg.currency}${((uncached * pricing[peak ? 'peak' : 'idle'].miss) / 1_000_000).toFixed(3)} / 命中 ${cfg.currency}${((T.cacheRead * pricing[peak ? 'peak' : 'idle'].hit) / 1_000_000).toFixed(3)} / 输出 ${cfg.currency}${((T.output * pricing[peak ? 'peak' : 'idle'].out) / 1_000_000).toFixed(3)}`,
         outShare !== null ? `- 输出占比 ${outShare}%(输出含思考 token;cacheCreation 按未命中价计)` : '- 输出占比: 暂无数据',
         `- 统计窗口: 会话始于 ${stamp(T.startedAt)} · 首轮于 ${hm(T.firstAt)} · 本实例 register 加载 ${T.loads.length} 次${T.loads.length > 1 ? '(热重载过 → 已续计,未丢轮次)' : '(未重载)'}${T.loads.length >= 20 ? ' ⚠ 加载次数触顶,可能频繁重载' : ''}`,
         '- 口径: 来自 turn.complete usage 聚合(仅主会话;该事件 usage = 该轮所有真实请求之和,CC 类型定义原文);计数持久在 $.state,热重载不清零;高峰=工作日 9-12/14-18 且非法定节假日,周末(含调休周末)与节假日全空闲;价目/档位/升级规则在 plugin/config.json。',
-        '- hooks 层(readDedup/outputTrim/coldStartGuard/modelDirector)计数见 <CLAUDE_CONFIG_DIR>/token-optimizer/state.json 与工具结果标注。',
+        '- hooks 层(readDedup/outputTrim/coldStartGuard/modelDirector)计数在 <CLAUDE_CONFIG_DIR>/plugins/store/cc-token-optimizer*.json 的 guard-state(v0.2.1 起跨会话);工具结果里的裁剪/存档标注同源。',
         compactLine,
       ].filter(Boolean).join('\n'),
       context: compactNote ? [compactNote] : undefined,

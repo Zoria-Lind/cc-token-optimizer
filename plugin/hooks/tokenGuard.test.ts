@@ -161,15 +161,35 @@ test('coldStartGuard:缓存未过期 → 不注入', async ($, on) => {
 test('modelDirector:命中 coding 关键词 → 注入升档提醒 + 提醒用户', async ($, on) => {
   const b = setupGuard(on)
   const r = await $.classic.UserPromptSubmit({ prompt: '帮我重构这个模块的架构设计' })
-  expect(JSON.stringify(r)).toMatch(/coding-pro/)
+  // 没有 config.json ⇒ 内置默认 skillName 为空 ⇒ 通用措辞:只建议 /model 切档,不点名技能
+  expect(JSON.stringify(r)).toMatch(/\/model deepseek-v4-pro/)
+  expect(JSON.stringify(r)).not.toMatch(/Skill/)
   expect(b.toasts.length).toBeGreaterThan(0)
 })
 
 test('modelDirector:普通短句 → 不打扰', async ($, on) => {
   const b = setupGuard(on)
   const r = await $.classic.UserPromptSubmit({ prompt: '好的' })
-  expect(JSON.stringify(r)).not.toMatch(/coding-pro/)
+  expect(JSON.stringify(r)).not.toMatch(/Skill|\/model deepseek/)
   expect(b.toasts.length).toBe(0)
+})
+
+test('modelDirector:config 配了 skillName → 升档建议点名该技能', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', {
+    text: JSON.stringify({ upgrade: { skillName: 'my-upgrade-skill' } }),
+    mtimeMs: 1, size: 40,
+  })
+  const r = await $.classic.UserPromptSubmit({ prompt: '帮我重构这个模块的架构设计' })
+  expect(JSON.stringify(r)).toMatch(/my-upgrade-skill/)
+})
+
+test('money:config 里的 currency 前缀会用在切换成本估算上', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: JSON.stringify({ currency: '$' }), mtimeMs: 1, size: 16 })
+  await $.classic.PreModelSwitch({ from_model: 'cheap-x', to_model: 'pro-y', context_tokens: 80000 })
+  // 80k × 4.5 元/M = 0.36,前缀换成 $ 后同额
+  expect(b.toasts.join(' ')).toMatch(/重缓存约 \$0\.36/)
 })
 
 test('modelDirector:长提示也算命中(长度启发式)', async ($, on) => {
