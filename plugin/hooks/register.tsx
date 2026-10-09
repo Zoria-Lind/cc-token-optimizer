@@ -6,6 +6,7 @@
 // 诊断刻度:每次 register() 往账本记一行 loads{时刻, 当时轮数, 当时无 usage 轮数} ——
 //   事后可判定缺数是"热重载丢的"还是"事件本身没收到"(口径行见 /token-status)。
 import type { Register } from 'claude-code'
+import { register as registerGuard } from './tokenGuard'
 
 const fmt = (n: number): string =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M`
@@ -48,7 +49,7 @@ const loadConfig = async ($: { fs: { read: (p: string) => Promise<string> }; plu
       upgrade: { ...DEFAULT_CONFIG.upgrade, ...cfg?.upgrade },
     }
   } catch { configCache = DEFAULT_CONFIG } // 读失败/坏 json → 内置默认,且缓存住不再每轮重试
-  return configCache
+  return configCache ?? DEFAULT_CONFIG
 }
 // 档位判定:模型名命中 models.pro → Pro 档,否则按 cheap 档计价
 const isProModel = (cfg: typeof DEFAULT_CONFIG, model: string | null | undefined): boolean =>
@@ -150,7 +151,10 @@ const saveTotals = async ($: any, T: UsageTotals): Promise<void> => {
   } catch { /* fail-open */ }
 }
 
-export const register: Register = (on) => {
+export const register: Register = (on, options) => {
+  // settings-hook 层六模块(readDedup/outputTrim/coldStartGuard/modelDirector 等)
+  // 由 tokenGuard.ts 注册 —— 随插件分发,不再依赖用户手工往 settings.json 里配。
+  registerGuard(on, options)
   const loadAt = Date.now()
   let T = newTotals(null, loadAt)
   let ready: Promise<void> | null = null

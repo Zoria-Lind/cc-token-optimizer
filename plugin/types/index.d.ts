@@ -31,10 +31,34 @@ export type UsageTotals = {
 /** 账本:key = String(startedAt) —— 多窗口并发各记各的,互不覆盖。 */
 export type UsageBook = Record<string, UsageTotals>
 
+/**
+ * 单个会话桶:动态键是文件绝对路径 → 读记录(tokenGuard 用),`_` 前缀是元字段。
+ * 与旧 state.json 同构,但宿主管生命周期 ⇒ 无需文件锁/原子写/LRU。
+ */
+export type GuardBucket = {
+  /** 最近活动时刻(修剪用)。 */
+  _at?: number
+  /** 最近改过代码的时刻(升档粘性窗口用)。 */
+  _codingAt?: number
+  /** 上次观测到的模型名。 */
+  _model?: string
+  /** 上次向用户发升档提醒的时刻(冷却用)。 */
+  _upgradeSugAt?: number
+} & Record<string, unknown>
+
+/** settings-hook 层六模块的持久状态,存 $.state 跨热重载续存。 */
+export type GuardState = {
+  /** 同文件连续拦截计数(逃生,防"内容不在却报已在"的死锁)。 */
+  _strikes?: Record<string, Record<string, number>>
+  /** 每会话的拦截/裁剪/折叠计数。 */
+  _stats?: Record<string, { denies: number; trims: number; trimmedChars: number; collapsedLines: number }>
+} & Record<string, GuardBucket | unknown>
+
 declare module 'claude-code' {
   interface PluginState {
     'cc-token-optimizer': {
       'usage-totals': UsageBook
+      'guard-state': GuardState
     }
   }
 }

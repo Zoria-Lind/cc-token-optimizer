@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# 裁剪前原输出的存档目录(运行时产物)
+plugin/.archive/

@@ -7,6 +7,11 @@
 
 import { test, expect } from 'claude-code/testing'
 
+// CC 2.1.293:testing 侧把 $.command.run 收窄为 CommandRunInput(要求 origin/presentation
+// 这两个只有引擎才设置的字段),而插件侧签名是 CommandRunArgs(只要 command,args 可选)。
+// 插件代码本身没问题 —— 这里统一走 runCmd 绕开该不一致。
+const runCmd = ($: any, command: string): Promise<{ text: string }> => $.command.run({ command })
+
 const setup = (on: any) => {
   const registered: string[] = []
   on('command.register', (_$: any, e: any) => {
@@ -49,7 +54,7 @@ test('turn.complete 聚合主会话 usage,subagent 轮次不计入', async ($, o
   await start($)
   await turn($, { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 }, undefined)
   await turn($, { input_tokens: 0, output_tokens: 999, cache_read_input_tokens: 9900, cache_creation_input_tokens: 0 }, 'sub-1')
-  const out = await $.command.run({ command: 'token-status' })
+  const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/轮次: 1/)
   expect(out.text).toMatch(/输入 1k/)
   expect(out.text).toMatch(/缓存读 9k/)
@@ -62,7 +67,7 @@ test('缓存命中率 = 缓存读 / 总输入(DeepSeek 语义:input 不含缓存
   await start($)
   // 100 + 400 + 500 = 1000 总输入,命中 400 → 40.0%
   await turn($, { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 400, cache_creation_input_tokens: 500 }, undefined)
-  const out = await $.command.run({ command: 'token-status' })
+  const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/命中率: 40\.0%/)
 })
 
@@ -70,7 +75,7 @@ test('usage 字段缺失不崩溃(防御性聚合)', async ($, on) => {
   setup(on)
   await start($)
   await turn($, null, undefined)
-  const out = await $.command.run({ command: 'token-status' })
+  const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/轮次: 0/)
   expect(out.text).toMatch(/命中率: 暂无数据/)
 })
@@ -86,7 +91,7 @@ test('B:账本跨热重载接续 —— 预置同会话账本 → 接着累加,�
   })
   await start($)
   await turn($, { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 }, undefined)
-  const out = await $.command.run({ command: 'token-status' })
+  const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/轮次: 3/) // 2(上一实例) + 1(本轮) —— 修复前这里会是 1
   expect(out.text).toMatch(/缓存读 14k/) // 5000 + 9000
   expect(out.text).toMatch(/register 加载 2 次\(热重载过 → 已续计,未丢轮次\)/)
@@ -102,7 +107,7 @@ test('B:账本属于别的会话(startedAt 不同)→ 开新账,不串数', asyn
   })
   await start($)
   await turn($, { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 }, undefined)
-  const out = await $.command.run({ command: 'token-status' })
+  const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/轮次: 1/) // 不是 43
   expect(out.text).toMatch(/register 加载 1 次\(未重载\)/)
 })
@@ -112,7 +117,7 @@ test('usage 缺失的轮次单独计数(诊断口径:区分"没收到事件"与"
   await start($)
   await turn($, null, undefined)
   await turn($, { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 400, cache_creation_input_tokens: 0 }, undefined)
-  const out = await $.command.run({ command: 'token-status' })
+  const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/轮次: 1\(另有 usage 缺失 1 轮、子代理 0 轮,未计价\)/)
 })
 

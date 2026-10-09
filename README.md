@@ -71,7 +71,31 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
 
 ## 安装
 
-`~/.claude/settings.json`(路径按实际安装位置改):
+**一条命令**(Claude Code 2.1.275+,在终端会话里输入):
+
+```
+/plugin install cc-token-optimizer --marketplace Zoria-Lind/cc-token-optimizer
+```
+
+会先问是否添加该 marketplace(`y`),再选作用域(推荐 `user`,对所有会话生效)。**装完即用,不需要动 `settings.json`,也不需要 `node`**:
+
+- 六个模块(readDedup / outputTrim / coldStartGuard / modelDirector 等)注册在插件内部的 `hooks/tokenGuard.ts`,随插件一起加载
+- 状态存在宿主管理的 `$.state` 里(不再是磁盘上的 `state.json`)
+- 配置读插件自带的 `config.json`,缺失或损坏时回退内置默认,不会报错
+
+更新:
+
+```
+/plugin marketplace update zoria-plugins
+/plugin update cc-token-optimizer@zoria-plugins
+```
+
+想改价目/模型名/升级规则,只改插件目录下的 `config.json`(格式见上),代码零改动。
+
+<details>
+<summary>旧方式:手动配 settings.json(依赖 Node,已不推荐)</summary>
+
+仓库里的 `hooks/token-hook.mjs` 是同一套逻辑的 **Node 版**(stdin JSON → stdout JSON)。它不随插件走,需要手工往 `~/.claude/settings.json` 里挂,并且依赖系统装了 `node`:
 
 ```json
 {
@@ -89,6 +113,8 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
   "subagentPromptCacheTtl": "1h"
 }
 ```
+
+**不要两条路一起走**:插件版和 Node 版处理同一批事件,同时挂着会让同一个工具调用被处理两次(拦截计数翻倍、输出被重复裁剪)。用了插件就别留 `hooks` 段。
 
 ## 设计红线
 
