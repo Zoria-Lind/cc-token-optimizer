@@ -1,7 +1,7 @@
 {
   "name": "cc-token-optimizer",
-  "version": "0.1.1",
-  "description": "Claude Code 会话 token 监视:上下文压力/累计 token/缓存命中率悬浮条 + /token-status 统计。与 settings-hook 层(hooks/token-hook.mjs:readDedup/outputTrim/coldStartGuard)配套。",
+  "version": "0.2.0",
+  "description": "Claude Code 会话 token 监视与省钱档位导演:readDedup 读去重、outputTrim 输出裁剪、coldStartGuard 冷启动守卫、modelDirector 档位提醒,外加成本/缓存命中率悬浮条与 /token-status。装完即用,无需配置。",
   "author": { "name": "Zoria-Lind" },
   "types": "./types/index.d.ts"
 }
