@@ -1,5 +1,52 @@
 # cc-token-optimizer
 
+**English quick start** · [中文说明见下](#中文说明)
+
+A Claude Code plugin that cuts what a session actually costs — read de-duplication, output trimming, cache-stall nudges, plus a live cost / cache-hit bar above the prompt. One command to install: no `settings.json` edits, no Node.
+
+### Modules
+
+| Module | Hook | What it does |
+|---|---|---|
+| **readDedup** | `PreToolUse` Read | Denies a re-read when the file is unchanged (mtime + size) and the requested range is already fully in context; partial overlap still passes. Three denials in a row → always passes. |
+| **outputTrim** | `PostToolUse` Bash/PowerShell | Folds runs of ≥3 identical lines; output over 5000 chars is archived to disk first, then head/tail sampled into context (1500+1500, or 800+800 when the command failed). |
+| **coldStartGuard** | `SessionStart` | A resumed session whose prompt cache expired gets one line: context size, estimated re-cache cost, and "consider `/clear`". |
+| **modelDirector** | `SessionStart` · `UserPromptSubmit` · model switches | Tier discipline driven by `config.json`: cheap by default, mechanical detection suggests upgrading for coding turns, and the cache-dropping cost is shown in ¥ before you switch models. |
+| **status bar** · `/token-status` | above the prompt · command | rounds, context %, input + cache read/write, output, cache hit rate, cost (peak / off-peak). |
+| **`tools/stats.mjs`** | manual | Sums denials, trims, folded lines and archive size across sessions, and estimates tokens saved. |
+
+### Install
+
+```
+/plugin install cc-token-optimizer --marketplace Zoria-Lind/cc-token-optimizer
+```
+
+Claude Code 2.1.275+. It asks whether to add the marketplace (`y`), then for a scope — `user` applies it to every session. Modules load from inside the plugin, and state lives in the host's plugin KV (`<config dir>/plugins/store/cc-token-optimizer*.json`), so counters survive across sessions and hot reloads.
+
+### Why it is cache-safe
+
+- It acts only at the **birth point** of content — before it enters context. Stored history is never rewritten: changing past bytes invalidates the prompt cache and costs more than it saves.
+- Everything is **fail-open**: on any error the plugin steps aside.
+- Trimmed output is **archived, not summarized** — the full original goes to disk and the model only sees the path.
+
+### Honest edges
+
+- **Pricing and model names default to DeepSeek** (dual peak / off-peak tiers). For another provider, edit `config.json` — pricing, model mapping and the upgrade heuristic all live there, with no code changes.
+- **modelDirector assumes this setup**: its upgrade suggestion points at a `coding-pro` skill that ships outside the plugin. On a stock install you may prefer `"defaultTier": "pro"` or to blank out the heuristic keywords.
+- **readDedup** compares mtime + size rather than content hashes (a same-second, same-size rewrite is missed), and recent Claude Code builds already answer whole-file re-reads natively — the remaining value is partial-overlap merging and long-span re-reads.
+- A denied read costs one failed round while the model retries; hence the 3-strike escape hatch.
+- Status-bar figures are aggregated from `turn.complete`, and `/compact` does not reset the running totals.
+
+### Links
+
+- [Claude Market](https://www.claudemarket.ai/plugins) — plugin directory
+
+MIT licensed · Chinese documentation below.
+
+---
+
+## 中文说明
+
 给 Claude Code 的 token 优化器。两层结构:
 
 ## hooks/(settings-hook 层,管内容)
