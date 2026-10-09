@@ -11,7 +11,7 @@ A Claude Code plugin that cuts what a session actually costs — read de-duplica
 | **readDedup** | `PreToolUse` Read | Denies a re-read when the file is unchanged (mtime + size) and the requested range is already fully in context; partial overlap still passes. Three denials in a row → always passes. |
 | **outputTrim** | `PostToolUse` Bash/PowerShell | Folds runs of ≥3 identical lines; output over 5000 chars is archived to disk first, then head/tail sampled into context (1500+1500, or 800+800 when the command failed). |
 | **coldStartGuard** | `SessionStart` | A resumed session whose prompt cache expired gets one line: context size, estimated re-cache cost, and "consider `/clear`". |
-| **modelDirector** | `SessionStart` · `UserPromptSubmit` · model switches | Tier discipline driven by `config.json`: cheap by default, mechanical detection suggests upgrading for coding turns, and the cache-dropping cost is shown in ¥ before you switch models. |
+| **modelDirector** | `SessionStart` · `UserPromptSubmit` · model switches · code edits | Tier discipline driven by `config.json`: cheap by default; mechanical detection suggests upgrading for coding turns (keyword hits or a recent edit — never on prompt length alone); the **first code edit of a turn is denied once** (code files by extension — editing docs is ignored; at most once per turn) so the model activates the upgrade skill and retries (one extra round trip; **off unless you set the `upgrade_skill` plugin option — it shows up in `/config`** — or `config.json`'s `upgrade.skillName`); the cache-dropping cost is shown before you switch models. |
 | **status bar** · `/token-status` | above the prompt · command | rounds, context %, input + cache read/write, output, cache hit rate, cost (peak / off-peak). |
 | **`tools/stats.mjs`** | manual | Sums denials, trims, folded lines and archive size across sessions, and estimates tokens saved. |
 
@@ -71,7 +71,8 @@ MIT licensed · Chinese documentation below.
 四个事件:
 
 - SessionStart:记录当前模型 + 注入档位纪律(主力档=cheap 时:基础档 → "拿不准就建议升 Pro",Pro → "任务完成后切回基础档";主力档=pro 时反之)
-- UserPromptSubmit 机械检测(coding 关键词/文件后缀 43 个 + 长提示阈值,见 config.json):命中 → ① 向模型注入**条件式**指令"若你不在 Pro 档,动手前先调用 Skill(coding-pro)"(每轮都给、不按记录档位拦截——回合级升档自动回落,state 档位可能滞后一拍);② 向用户显示 systemMessage(10 分钟冷却,记录档位已是 Pro 时不发)。**升档由机械检测驱动,不依赖模型自评** —— 自指坑的解法
+- UserPromptSubmit 机械检测(coding 关键词/文件后缀 43 个,见 config.json;**长文本不再单独触发** —— 粘网页/日志不会误报升档):命中 → ① 向模型注入**条件式**指令"若你不在 Pro 档,动手前先调用 Skill(coding-pro)"(每轮都给、不按记录档位拦截——回合级升档自动回落,state 档位可能滞后一拍);② 向用户显示 systemMessage(10 分钟冷却,记录档位已是 Pro 时不发)。**升档由机械检测驱动,不依赖模型自评** —— 自指坑的解法
+- **硬升档闸(`tool.call` Edit/Write/NotebookEdit)**:本回合**首次改动代码文件**(按扩展名判;改 `.md` 等文档不拦)时,若会话基础档还是便宜档、且配了 `upgrade_skill` 插件选项 → **拦一次**,要求模型先调用该技能再**重试**刚才那次调用(该回合余下推理走强档;代价=一次往返;**每回合最多强制一次**,靠回合序号去重)。**判据是模型自己的动作**(它决定改代码 = 这轮是 coding),不靠猜用户文本 —— "用户没说、自己也拿不准"的情况只有这条路能自动升档。`skillName` 留空则只提醒不拦
 - 配套技能:`<配置目录>/skills/coding-pro/SKILL.md`(frontmatter `model:` 指向强档模型)—— 激活期间本回合跑 Pro、下一轮自动回落、不落盘。技能的 `model:` 头是 CC 里唯一"非用户触发"的模型切换机制(hook 切不了模型,官方文档确认;2026-10-07 实测跑通)
 - PreModelSwitch 切换成本透明:"切换将丢弃提示缓存,上下文约 80k,重缓存约 ¥0.36",提示任务边界再切
 - PostModelSwitch 记录新档位 + 注入对应提醒(切到 Pro:用完记得切回;切到基础档:拿不准就升)
@@ -84,7 +85,7 @@ MIT licensed · Chinese documentation below.
 
 AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 缓存命中率 / **成本 ¥(按当前档位计价,空闲/高峰 + Pro 标记)**;`/token-status` 命令看明细(当前模型档位、输入未命中/命中/输出三段成本拆分)。
 
-**配置(`plugin/config.json`,可分发形式)**:价目双档(cheap/pro,元/百万 token)、节假日表、模型名映射、升级启发式参数(关键词/长提示阈值/冷却)——换供应商(如 GLM)、换模型名只改 json 不动代码,缺失/坏 json 时内置 DeepSeek 默认兜底。DeepSeek 口径:高峰=北京时间周一至周五(非法定节假日)9:00-12:00、14:00-18:00,**周末(含调休周末)与节假日全天空闲**。
+**配置(`plugin/config.json`,可分发形式)**:价目双档(cheap/pro,元/百万 token)、节假日表、模型名映射、升级启发式参数(关键词/粘性窗口/冷却)——换供应商(如 GLM)、换模型名只改 json 不动代码,缺失/坏 json 时内置 DeepSeek 默认兜底。DeepSeek 口径:高峰=北京时间周一至周五(非法定节假日)9:00-12:00、14:00-18:00,**周末(含调休周末)与节假日全天空闲**。
 
 **usage 折算(两种端点语义自动兼容)**:实测 DeepSeek Anthropic 兼容层的 `input_tokens` **不含缓存读**(cacheRead > input);Anthropic 官方的 `input_tokens` 含缓存读。按 miss 价部分 = `cacheRead > input ? input + cacheCreation : input - cacheRead`,命中部分 = cacheRead,输出含思考 token。
 
@@ -98,7 +99,7 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
   },
   "models": { "cheap": "你的便宜模型名", "pro": "你的强模型名" },
   "currency": "$",
-  "upgrade": { "minPromptChars": 120, "keywords": ["你的业务词…"], "cooldownMin": 10, "skillName": "" }
+  "upgrade": { "keywords": ["你的业务词…"], "cooldownMin": 10, "stickyMin": 30, "skillName": "" }
 }
 ```
 
@@ -106,7 +107,7 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
 - **无缓存折扣或折扣口径不同的供应商**(如 Anthropic 官方是 cache-read 折扣、cache-write 溢价):hit 填 0 或按你的实际折扣填,成本行会退化为"未命中+输出"估算,量级仍近似
 - **模型名判定**:插件按 `models.pro` 精确匹配判定 Pro 档(通用);`includes('pro')` 只是 DeepSeek 命名的兜底启发式,填了 models 映射后任何供应商都正确
 - **货币符号**:`currency` 是金额前缀(默认 `¥`),悬浮条、`/token-status`、切换成本估算都用它 —— 用美元就填 `"$"`
-- **升档建议里的技能名**:`upgrade.skillName` 填你自己的"强档技能"(该技能 SKILL.md 的 `model:` 头负责切档;这是 CC 里唯一非用户触发的切换通路);**留空**则升档建议退化为"请用户 /model 切换"的通用说法 —— 没有这类技能的用户请留空(本仓库自带值是作者自用的 `coding-pro`)
+- **升档建议里的技能名**:**硬升档闸需要一个"强档技能"**(该技能 SKILL.md 的 `model:` 头负责切档;这是 CC 里唯一非用户触发的切换通路)。**插件自带的默认是空** —— 没有这类技能的人开箱不会被拦。要用请填**插件选项** `upgrade_skill`(在 `/config` 里就有这一行;值存在你自己的 `settings.json`,插件升级不会覆盖),它优先于 `config.json` 的 `upgrade.skillName`;留空则升档只走"提醒用户 /model"
 - **hooks 安装路径**:settings.json 里 `args` 的绝对路径按你的安装位置改(README 示例用占位符)
 - 卖/分发时:用户只改这一个 json + settings.json 路径,代码零改动
 

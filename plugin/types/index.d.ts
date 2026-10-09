@@ -44,6 +44,10 @@ export type GuardBucket = {
   _model?: string
   /** 上次向用户发升档提醒的时刻(冷却用)。 */
   _upgradeSugAt?: number
+  /** 本会话的回合序号(每次用户发言 +1);硬升档闸据此保证每回合最多强制一次。 */
+  _turn?: number
+  /** 上次"硬升档闸"强制发生在哪一回合(与 _turn 比对;相等=本回合已强制过)。 */
+  _forcedTurn?: number
 } & Record<string, unknown>
 
 /**

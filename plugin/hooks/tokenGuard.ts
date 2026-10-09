@@ -33,6 +33,16 @@ const SESSION_KEEP = 5
 const STICKY_DEFAULT_MIN = 30
 const ARCHIVE_KEEP = 20
 const STATS_KEEP = 60
+// 硬升档闸只对**代码文件**生效:改 README/记忆/纯文档不算 coding,拦下来只会让用户白丢一轮
+// (2026-10-09 实测:闸门对任何 Edit/Write 都生效时,改文档也会被拦)。按扩展名(小写)判断。
+const CODE_EXT = new Set([
+  'ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs', 'py', 'pyi', 'ps1', 'psm1', 'sh', 'bash', 'zsh', 'fish',
+  'go', 'rs', 'java', 'kt', 'kts', 'swift', 'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'cs', 'fs', 'rb', 'php', 'lua',
+  'r', 'jl', 'pl', 'scala', 'ex', 'exs', 'erl', 'hs', 'ml', 'dart', 'groovy', 'gradle', 'cmake', 'mk',
+  'sql', 'proto', 'graphql', 'gql', 'vue', 'svelte', 'astro', 'css', 'scss', 'less', 'html', 'htm',
+  'json', 'jsonc', 'toml', 'yaml', 'yml', 'ini', 'conf', 'cfg', 'ipynb',
+])
+const CODE_BASENAMES = new Set(['dockerfile', 'makefile', 'cmakelists.txt'])
 // 改动类工具(用于落 coding 流时间戳)。注意:原 Node 版还列了 MultiEdit,
 // 但 CC 2.1.293 的工具表里没有它(matcher 是类型化的,会被拒绝)—— 故移除。
 const CODING_TOOLS = ['Edit', 'Write', 'NotebookEdit'] as const
@@ -48,7 +58,7 @@ type Cfg = {
   currency: string
   /** skillName 非空 → 升档建议让模型调用该技能(技能的 `model:` 头是 CC 里唯一非用户触发的切档通路);
    *  留空 → 退化为通用措辞(建议用户自己 /model)。 */
-  upgrade: { minPromptChars: number; keywords: string[]; cooldownMin: number; stickyMin: number; skillName: string }
+  upgrade: { keywords: string[]; cooldownMin: number; stickyMin: number; skillName: string }
 }
 const DEFAULT_CONFIG: Cfg = {
   defaultTier: 'pro',
@@ -60,7 +70,6 @@ const DEFAULT_CONFIG: Cfg = {
   models: { cheap: 'deepseek-v4-flash', pro: 'deepseek-v4-pro[1m]' },
   currency: '¥',
   upgrade: {
-    minPromptChars: 120,
     keywords: ['设计', '架构', '重构', '方案', '决策', '算法', 'design', 'architecture', 'refactor', 'plan'],
     cooldownMin: 10,
     stickyMin: STICKY_DEFAULT_MIN,
@@ -87,6 +96,12 @@ async function loadConfig($: any): Promise<Cfg> {
 }
 const isProModel = (cfg: Cfg, m: string | null | undefined): boolean =>
   !!m && (m === cfg.models.pro || (String(m).includes('pro') && !String(m).includes('flash')))
+// 强档技能名的**用户级覆盖**:manifest 的 userConfig `upgrade_skill` 由宿主解析进 register(on, options)
+// (值存用户 settings.json 的 pluginConfigs,改它会重载插件)。优先级:插件选项 > config.json 的 skillName。
+// 有了它,插件自带的 config.json 可以留空(陌生人零副作用 —— 不会去调用一个他没有的技能),
+// 而想用硬升档闸的人在自己的 /config 里填一个技能名即可,插件升级也不会覆盖。
+let optSkillName = ''
+const effectiveSkill = (cfg: Cfg): string => optSkillName || cfg.upgrade.skillName || ''
 
 // ============================ 纯逻辑(与 Node 版同源) ============================
 function mergeRanges(ranges: number[][], add: number[]): number[][] {
@@ -167,6 +182,14 @@ function ctxKey(e: any, session: string): string {
 function filePathOf(e: any): string | undefined {
   const p = e?.tool_input?.file_path ?? e?.file_path
   return typeof p === 'string' ? p : undefined
+}
+// 硬升档闸的门槛:只有代码文件才值得强制升档(见 CODE_EXT);路径形态两种载荷都吃
+function isCodePath(path: string | undefined): boolean {
+  if (!path) return false
+  const base = path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? ''
+  if (CODE_BASENAMES.has(base)) return true
+  const dot = base.lastIndexOf('.')
+  return dot >= 0 && CODE_EXT.has(base.slice(dot + 1))
 }
 function toolNameOf(e: any): string {
   return String(e?.tool_name ?? e?.tool ?? '')
@@ -300,15 +323,55 @@ async function recordRead($: any, e: any): Promise<void> {
   await writeState($, state)
 }
 
-// markCodingActivity:改动类工具落时间戳(供升级提醒的粘性窗口)
-async function markCodingActivity($: any, e: any): Promise<void> {
+// 每回合把序号 +1:硬升档闸据此保证「每回合最多强制一次」(见 codingToolGate)。
+// ⚠ 实测(2026-10-09)两条:①$.session.model() 反映的是**会话基础档**,技能的 model: 头切档它看不见
+// ⇒ 不能用"冷却时间"去重(长回合里会每 60 秒重复拦同一件事);②用**回合序号**而非时间戳 ——
+// 时间戳在"从未打过回合标记"时会被误判成"本回合已经强制过",该拦的就不拦了。
+async function markTurn($: any, e: any): Promise<void> {
   const session = await sessionId($, e)
   const state = await readState($)
   const sess = state[session] ?? {}
-  sess._codingAt = Date.now()
+  sess._turn = (sess._turn ?? 0) + 1
   sess._at = Date.now()
   state[session] = sess
   await writeState($, state)
+}
+// 改动类工具:①落 coding 时间戳(升档粘性窗口) ②硬升档闸 —— 当前在基础档且配了升级技能时,
+// 拦一次"模型对本回合代码的首次改动",要它先激活技能再重试;该回合余下推理就走强档。
+// 判据是模型自己的动作(它决定改代码=这轮是 coding),不是猜用户文本;决定仍由插件做出。
+// 档位取 $.session.model():它是**会话基础档**(实测技能的回合级切档它看不见),所以只用它判断
+// "用户是不是本来就常驻强档",不用它去重;去重靠 `_turn`/`_forcedTurn`(每回合最多强制一次)。
+// 没配技能名时完全不拦(没技能可调,拦下来只会让模型卡住)。
+async function codingToolGate($: any, e: any): Promise<string | null> {
+  const session = await sessionId($, e)
+  const state = await readState($)
+  const sid = session
+  const sess = state[sid] ?? {}
+  sess._codingAt = Date.now()
+  sess._at = Date.now()
+  state[sid] = sess
+  let deny: string | null = null
+  const cfg = await loadConfig($)
+  const skill = effectiveSkill(cfg)
+  if (skill) {
+    let live: unknown = null
+    try { live = await $.session.model() } catch { /* 取不到当未知 */ }
+    // 每回合最多强制一次:用回合序号比对(时间戳在"未打标记"时会误判为已强制,且同毫秒会撞)
+    const turn = sess._turn ?? 0
+    // 只拦代码文件(改文档不拦);档位未知时不拦:拦了却给不出可行的下一步,比不拦更糟(fail-open)
+    if (
+      (sess._forcedTurn ?? -1) !== turn &&
+      isCodePath(filePathOf(e)) &&
+      typeof live === 'string' && live !== '' && !isProModel(cfg, live)
+    ) {
+      sess._forcedTurn = turn
+      deny =
+        `[cc-token-optimizer] 本回合首次改动代码,但当前是基础档:请先调用 Skill 工具(${skill}) ` +
+        `让后续在强档执行(回合级、下一轮自动回落),然后**重试刚才那次调用** —— 只多花一次往返。`
+    }
+  }
+  await writeState($, state)
+  return deny
 }
 
 // outputTrim:重复行折叠 + 超长输出头尾采样 → updatedToolOutput
@@ -382,7 +445,7 @@ async function setSessionModel($: any, session: string, model: string): Promise<
 }
 function tierAdvice(cfg: Cfg): { stay: string; up: string } {
   const isProDefault = cfg.defaultTier !== 'cheap'
-  const skill = cfg.upgrade.skillName
+  const skill = effectiveSkill(cfg)
   const upCheap = skill
     ? `涉及 coding(写/改代码、调试、重构、脚本、报错)时,先调用 Skill 工具(${skill}) 让本回合跑 Pro 档(回合级、自动回落),再动手;其他复杂任务可在动手前建议用户 /model ${cfg.models.pro}。`
     : `涉及 coding(写/改代码、调试、重构、脚本、报错)时,建议用户先 /model ${cfg.models.pro} 升 Pro 档再动手;其他复杂任务同理。`
@@ -412,21 +475,22 @@ async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalC
   const session = await sessionId($, e)
   const state = await readState($)
   const up = cfg.upgrade
-  const lenOk = prompt.length >= (up.minPromptChars ?? 120)
   const kwHit = (up.keywords ?? []).some((k) => prompt.toLowerCase().includes(String(k).toLowerCase()))
   const codingFlow = Date.now() - (state[session]?._codingAt ?? 0) < (up.stickyMin ?? STICKY_DEFAULT_MIN) * 60_000
-  if (!lenOk && !kwHit && !codingFlow) return null
+  // 长度不再单独触发(2026-10-09):阈值 120 字符时粘贴网页/日志必然命中,而"长"与"复杂任务"无关,
+  // 误报的代价是用户白升 Pro —— 省钱插件让人多花钱是最糟的方向。只认关键词命中与粘性窗口。
+  if (!kwHit && !codingFlow) return null
   const model = state[session]?._model ?? null
   // 给模型的指令:条件式、每轮都给、不带冷却(档位判定交给模型读自己每轮的系统提示,不按 state 拦)
-  const skill = cfg.upgrade.skillName
+  const skill = effectiveSkill(cfg)
   const additionalContext =
-    `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : lenOk ? '长提示' : ' coding 流(近期有代码改动)'}:` +
+    `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : ' coding 流(近期有代码改动)'}:` +
     (skill
       ? `若你当前不在 Pro 档,动手前先调用 Skill 工具(${skill})让本回合以 Pro 档执行(回合级、自动回落;改一行/加注释这类小事可不调用);已在 Pro 档则忽略本条。`
       : `若你当前不在 Pro 档,动手前建议用户 /model ${cfg.models.pro} 升档再动手(改一行/加注释这类小事可不升);已在 Pro 档则忽略本条。`)
-  // 给用户的提示:只对关键词/长提示发;带冷却;记录档位已是 Pro 时不发(避免误导)
+  // 给用户的提示:只对关键词命中发(粘性窗口下的短句续接只提醒模型、不打扰用户);带冷却;记录档位已是 Pro 时不发
   const last = state[session]?._upgradeSugAt ?? 0
-  if ((kwHit || lenOk) && !isProModel(cfg, model) && Date.now() - last >= (up.cooldownMin ?? 10) * 60_000) {
+  if (kwHit && !isProModel(cfg, model) && Date.now() - last >= (up.cooldownMin ?? 10) * 60_000) {
     const s2 = await readState($)
     const sess = s2[session] ?? {}
     sess._upgradeSugAt = Date.now()
@@ -436,9 +500,9 @@ async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalC
     return {
       additionalContext,
       toast: skill
-        ? `[cc-token-optimizer] 本条判为${kwHit ? 'coding 任务' : '长任务'},本回合按 Pro 档执行(下一轮自动回 ${cfg.models.cheap})。` +
+        ? `[cc-token-optimizer] 本条判为 coding 任务,本回合按 Pro 档执行(下一轮自动回 ${cfg.models.cheap})。` +
           `想让整段会话都用 Pro 就 /model ${cfg.models.pro};否则无需操作。`
-        : `[cc-token-optimizer] 本条判为${kwHit ? 'coding 任务' : '长任务'}。未配升级技能,请自行 /model ${cfg.models.pro} 切强档(下次启动自动回 ${cfg.models.cheap})。`,
+        : `[cc-token-optimizer] 本条判为 coding 任务。未配升级技能,请自行 /model ${cfg.models.pro} 切强档(下次启动自动回 ${cfg.models.cheap})。`,
     }
   }
   return { additionalContext }
@@ -482,10 +546,13 @@ async function toast($: any, text: string | undefined): Promise<void> {
 }
 
 // ============================ 注册 ============================
-export const register: Register = (on) => {
+export const register: Register = (on, options) => {
   // 每次插件加载重读 config.json(loadConfig 会读一次缓存住):热重载/新会话改完配置即生效,
   // 引擎级测试里各用例也不会串用上一个用例的配置。
   cfgCache = null
+  // userConfig 选项(manifest 声明,宿主解析后经 options 传来):强档技能名的用户级覆盖
+  const v = (options as Record<string, unknown> | undefined)?.upgrade_skill
+  optSkillName = typeof v === 'string' ? v.trim() : ''
   // SessionStart:coldStartGuard + modelPolicy 合并注入(都走 additionalContext)
   on('classic.SessionStart', async ($, e, next) => {
     try {
@@ -503,6 +570,7 @@ export const register: Register = (on) => {
   on('classic.UserPromptSubmit', async ($, e, next) => {
     try {
       const cfg = await loadConfig($)
+      await markTurn($, e) // 回合标记:硬升档闸每回合最多强制一次
       const out = await upgradeHeuristic($, e, cfg)
       if (out) {
         await toast($, out.toast)
@@ -548,9 +616,12 @@ export const register: Register = (on) => {
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : undefined))
 
-  // 改动类工具:落 coding 时间戳(供升级提醒的粘性窗口)
+  // 改动类工具:落 coding 时间戳 + 硬升档闸(见 codingToolGate)
   on('tool.call', { tool: CODING_TOOLS }, async ($, e, next) => {
-    try { await markCodingActivity($, e) } catch { /* fail-open */ }
+    try {
+      const reason = await codingToolGate($, e)
+      if (reason) return { deny: reason }
+    } catch { /* fail-open */ }
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : undefined))
 

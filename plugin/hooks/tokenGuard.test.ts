@@ -14,6 +14,7 @@ const setupGuard = (on: any) => {
   const store = new Map<string, unknown>()
   const toasts: string[] = []
   let session = 'sess-1' // 可切换:用来验证跨会话分桶
+  let liveModel: string | null = 'deepseek-flash[1m]' // 实时档位,硬升档闸的判据
   const pick = (e: any): string => (typeof e === 'string' ? e : String(e?.path ?? ''))
   // 路径形态不确定,只放一个文件时按"唯一文件"兜底,不影响测试语义
   const lookup = (e: any): FsFile | undefined => files.get(pick(e)) ?? [...files.values()][0]
@@ -39,6 +40,7 @@ const setupGuard = (on: any) => {
   })
   // 会话 id:mod 的 tool.call 载荷不带 session_id,插件必须从 $.session.id() 取(见 sessionId())
   on('session.id', () => ({ value: session }))
+  on('session.model', () => ({ value: liveModel })) // 硬升档闸读实时档位
   on('ui.toast', (_$: any, e: any) => {
     toasts.push(typeof e === 'string' ? e : String(e?.text ?? ''))
     return { value: undefined }
@@ -54,7 +56,7 @@ const setupGuard = (on: any) => {
   // 引擎执行工具后的回传(代表真实工具)
   on('tool.call', () => ({ result: { text: 'file content' } }))
 
-  return { files, store, toasts, setSession: (s: string) => { session = s } }
+  return { files, store, toasts, setSession: (s: string) => { session = s }, setModel: (m: string | null) => { liveModel = m } }
 }
 
 const readArgs = (path: string, id: string, offset = 1, limit = 2000) => ({
@@ -192,10 +194,70 @@ test('money:config 里的 currency 前缀会用在切换成本估算上', async 
   expect(b.toasts.join(' ')).toMatch(/重缓存约 \$0\.36/)
 })
 
-test('modelDirector:长提示也算命中(长度启发式)', async ($, on) => {
-  setupGuard(on)
+// —— 硬升档闸:模型决定改代码 = 事实上的 coding 判定,插件据此把它当轮推到强档 ——
+const editArgs = (p: string, id: string) => ({
+  tool: 'Edit' as const, file_path: p, old_string: 'a', new_string: 'b', tool_use_id: id,
+})
+const skillCfg = JSON.stringify({ upgrade: { skillName: 'my-upgrade-skill' } })
+
+test('硬升档闸:基础档 + 配了技能 → 拦首次改动,要求先激活技能再重试', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  const r = await $.tool.call(editArgs('/x.ts', 'ed1'))
+  expect(JSON.stringify(r)).toMatch(/my-upgrade-skill/)
+  expect(JSON.stringify(r)).toMatch(/重试/)
+})
+
+test('硬升档闸:同一回合内第二次改动不再拦(防"拦→重试→再拦"死循环)', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  await $.classic.UserPromptSubmit({ prompt: '帮我改个东西' }) // 回合标记
+  await $.tool.call(editArgs('/x.ts', 'ed1'))
+  const r2 = await $.tool.call(editArgs('/x.ts', 'ed2'))
+  expect(JSON.stringify(r2)).not.toMatch(/my-upgrade-skill/)
+})
+
+test('硬升档闸:新回合的首次改动会再拦一次(每回合最多一次)', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  await $.classic.UserPromptSubmit({ prompt: '帮我改个东西' })
+  const r1 = await $.tool.call(editArgs('/x.ts', 'ed1'))
+  expect(JSON.stringify(r1)).toMatch(/my-upgrade-skill/)
+  await $.classic.UserPromptSubmit({ prompt: '继续改' }) // 新回合
+  const r2 = await $.tool.call(editArgs('/x.ts', 'ed2'))
+  expect(JSON.stringify(r2)).toMatch(/my-upgrade-skill/)
+})
+
+test('硬升档闸:实时档位已是 Pro → 不拦(技能切档不走 PostModelSwitch,必须读实时值)', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  b.setModel('deepseek-v4-pro[1m]')
+  const r = await $.tool.call(editArgs('/x.ts', 'ed1'))
+  expect(JSON.stringify(r)).not.toMatch(/my-upgrade-skill/)
+})
+
+test('硬升档闸:没配 skillName → 不拦,但粘性窗口照记', async ($, on) => {
+  const b = setupGuard(on)
+  const r = await $.tool.call(editArgs('/x.ts', 'ed1'))
+  expect(JSON.stringify(r)).not.toMatch(/Skill/)
+  const held = b.store.get('guard-state') as any
+  expect(JSON.stringify(held)).toMatch(/_codingAt/)
+})
+
+test('硬升档闸:改文档(.md)不拦,无扩展名的代码文件(Dockerfile)按 basename 判', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  const r1 = await $.tool.call({ tool: 'Edit', file_path: '/notes.md', old_string: 'a', new_string: 'b', tool_use_id: 'md1' })
+  expect(JSON.stringify(r1)).not.toMatch(/my-upgrade-skill/)
+  const r2 = await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\Dockerfile', old_string: 'a', new_string: 'b', tool_use_id: 'dk1' })
+  expect(JSON.stringify(r2)).toMatch(/my-upgrade-skill/)
+})
+
+test('modelDirector:长文本但无关键词、近期无改动 → 不打扰(长度不再单独触发)', async ($, on) => {
+  const b = setupGuard(on)
   const r = await $.classic.UserPromptSubmit({ prompt: '请'.repeat(200) })
-  expect(JSON.stringify(r)).toMatch(/长提示/)
+  expect(JSON.stringify(r)).not.toMatch(/Skill|\/model deepseek/)
+  expect(b.toasts.length).toBe(0)
 })
 
 // —— 状态迁移回归:必须落 $.store(跨会话),不能再退回会话级 $.state ——

@@ -26,7 +26,7 @@ const DEFAULT_CONFIG: {
   models: { cheap: string; pro: string }
   /** 金额前缀(¥ / $ / 元 等),与 tokenGuard 层同名同义(两处各自读同一个 config.json)。 */
   currency: string
-  upgrade: { minPromptChars: number; keywords: string[]; cooldownMin: number }
+  upgrade: { keywords: string[]; cooldownMin: number }
 } = {
   pricing: {
     cheap: { idle: { hit: 0.02, miss: 1, out: 4 }, peak: { hit: 0.04, miss: 2, out: 8 } },
@@ -35,7 +35,7 @@ const DEFAULT_CONFIG: {
   holidays: ['2026-01-01', '2026-05-01', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'],
   models: { cheap: 'deepseek-v4-flash', pro: 'deepseek-v4-pro[1m]' },
   currency: '¥',
-  upgrade: { minPromptChars: 120, keywords: ['设计', '架构', '重构', '方案', '决策', '算法', 'design', 'architecture', 'refactor', 'plan'], cooldownMin: 10 },
+  upgrade: { keywords: ['设计', '架构', '重构', '方案', '决策', '算法', 'design', 'architecture', 'refactor', 'plan'], cooldownMin: 10 },
 }
 // 读取一次后缓存(含失败回退,避免每轮渲染都读盘);mods 层禁 node 内置模块,走官方 $.fs.read
 let configCache: typeof DEFAULT_CONFIG | null = null
