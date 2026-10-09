@@ -46,7 +46,11 @@ export type GuardBucket = {
   _upgradeSugAt?: number
 } & Record<string, unknown>
 
-/** settings-hook 层六模块的持久状态,存 $.state 跨热重载续存。 */
+/**
+ * settings-hook 层六模块的持久状态:存宿主插件 KV 的 'guard-state' 键(`$.store`)。
+ * ⚠ 不是 `$.state` —— 那是会话级内存(会话结束即失);跨会话的统计/已读记录/粘性窗口必须走 store。
+ *   落点:`<配置目录>/plugins/store/cc-token-optimizer*.json`。
+ */
 export type GuardState = {
   /** 同文件连续拦截计数(逃生,防"内容不在却报已在"的死锁)。 */
   _strikes?: Record<string, Record<string, number>>
@@ -57,8 +61,8 @@ export type GuardState = {
 declare module 'claude-code' {
   interface PluginState {
     'cc-token-optimizer': {
+      // 只剩悬浮条账本;tokenGuard 的 guard-state 已改挂 $.store,不再经 PluginState
       'usage-totals': UsageBook
-      'guard-state': GuardState
     }
   }
 }

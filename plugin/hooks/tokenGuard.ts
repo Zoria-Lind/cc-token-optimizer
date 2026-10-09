@@ -10,8 +10,10 @@
 //
 // 与 Node 版的差异(仅 I/O 层):
 //   * 文件读写 → $.fs.read / $.fs.write / $.fs.stat / $.fs.list(异步)
-//   * state.json → $.state(宿主保存、热重载不清零)
-//     ⇒ 原版的 mkdir 锁 / tmp+rename 原子写 / LRU 整套消失:单实例、无跨进程争抢
+//   * state.json → $.store(宿主保存,**跨会话**与热重载都在)
+//     ⚠ 别用 $.state:那是会话级内存("held by the host for the session"),会话一结束就蒸发,
+//       统计/已读记录/粘性窗口全要跨会话 ⇒ 必须用 $.store(落 <配置目录>/plugins/store/)
+//     ⇒ 原版的 mkdir 锁 / tmp+rename 原子写整套消失:单实例、无跨进程争抢
 //   * console.log(JSON) → 直接 return(⚠ classic hook 的返回是**扁平字段**,
 //     不是 settings hook stdout 的 { hookSpecificOutput: {...} } 包装 —— 引擎自己做那层转换)
 //   * 给用户的提示(setTimeout 里的 systemMessage)→ $.ui.toast
@@ -30,6 +32,7 @@ const MAX_FILES_PER_SESSION = 200
 const SESSION_KEEP = 5
 const STICKY_DEFAULT_MIN = 30
 const ARCHIVE_KEEP = 20
+const STATS_KEEP = 60
 // 改动类工具(用于落 coding 流时间戳)。注意:原 Node 版还列了 MultiEdit,
 // 但 CC 2.1.293 的工具表里没有它(matcher 是类型化的,会被拒绝)—— 故移除。
 const CODING_TOOLS = ['Edit', 'Write', 'NotebookEdit'] as const
@@ -135,14 +138,22 @@ function trimAndCollapse(text: string, isErr: boolean): { text: string; collapse
   const cut = c.slice(0, head) + `\n...(中间省略 ${c.length - head - tail} 字符)...\n` + c.slice(-tail) + note
   return { text: cut, collapsed, trimmedChars: origLen - cut.length }
 }
+// 会话 id:状态现在落在**跨会话**的 $.store 里,必须拿到真会话 id 才能分桶。
+// ⚠ mod 的 tool.call 载荷不带 session_id,只靠 e.session_id 会全部退化成 'default'
+//   ⇒ 所有会话挤进同一个桶、互相污染(readDedup 拿错记录、_stats 串账)。
+// 首选 $.session.id()(引擎给的真 id),取不到才回退载荷。
+async function sessionId($: any, e: any): Promise<string> {
+  try {
+    const id = await $.session.id()
+    if (typeof id === 'string' && id !== '') return id
+  } catch { /* 回退载荷 */ }
+  return e?.session_id ?? 'default'
+}
 // 上下文键:子 agent 独立成桶(payload 里只有 agent_id 可区分)
-function ctxKey(e: any): string {
-  // classic 事件用 snake_case(session_id/agent_id),mod 原生事件用 camelCase(agentId),两者都认。
-  // 注:mod 的 tool.call 载荷没有 session_id,实际落在 'default' 桶 —— 不影响正确性,
-  // 因为 $.state 本身就是会话级,会话隔离由宿主保证;子 agent 靠 agentId 分桶仍成立。
-  const s = e.session_id ?? 'default'
+function ctxKey(e: any, session: string): string {
+  // classic 事件用 snake_case(agent_id),mod 原生事件用 camelCase(agentId),两者都认。
   const agent = e.agent_id ?? e.agentId
-  return agent ? `${s}::agent:${agent}` : s
+  return agent ? `${session}::agent:${agent}` : session
 }
 // 事件载荷兼容:classic.* 的 e 是 stdin JSON(tool_input.file_path / tool_name),
 // mod 原生 tool.call 的 e 是展平的(file_path / tool)。两处都取,哪个在就用哪个。
@@ -154,18 +165,21 @@ function toolNameOf(e: any): string {
   return String(e?.tool_name ?? e?.tool ?? '')
 }
 
-// ============================ state($.state 替代 state.json) ============================
-const STATE_REF = { plugin: 'cc-token-optimizer', key: 'guard-state' } as const
+// ============================ state($.store 替代 state.json) ============================
+// 一个 key 存整份状态(与旧 state.json 同构):$.store 的 set 是整值覆盖,读改写一次到位。
+// 与 $.state 的差别只有生命周期:这里跨会话,那边会话级。
+const STORE_KEY = 'guard-state'
 async function readState($: any): Promise<any> {
-  try { return (await $.state.get(STATE_REF))?.value ?? {} } catch { return {} }
+  try { return (await $.store.get(STORE_KEY)) ?? {} } catch { return {} }
 }
 async function writeState($: any, s: any): Promise<void> {
-  try { await $.state.set(STATE_REF, s) } catch { /* 写失败不致命 */ }
+  try { await $.store.set(STORE_KEY, s) } catch { /* 写失败不致命 */ }
 }
 function statEntry(state: any, session: string) {
   state._stats = state._stats ?? {}
-  state._stats[session] ??= { denies: 0, trims: 0, trimmedChars: 0, collapsedLines: 0 }
-  return state._stats[session]
+  const s = (state._stats[session] ??= { denies: 0, trims: 0, trimmedChars: 0, collapsedLines: 0 })
+  s._at = Date.now() // 给 pruneStats 排序用(不是会话桶的 _at)
+  return s
 }
 // 文件 stat:$.fs.stat → { kind, size, mtimeMs };非普通文件返回 null
 async function fileStat($: any, p: string): Promise<{ mtimeMs: number; size: number } | null> {
@@ -193,7 +207,7 @@ async function archiveOriginal($: any, session: string, tool: string, raw: strin
     return path
   } catch { return null }
 }
-// 修剪:$.state 由宿主管生命周期,这里只保留最必要的会话数上限
+// 修剪:状态跨会话累积在同一个 store 文件里(有 4 MiB 上限),保留最近活跃的若干会话桶
 function pruneState(state: any): void {
   const keys = Object.keys(state).filter((k) => k !== '_strikes' && k !== '_stats')
   const mains = keys.filter((k) => !k.includes('::agent:'))
@@ -206,6 +220,16 @@ function pruneState(state: any): void {
   if (state._strikes) {
     for (const k of Object.keys(state._strikes)) if (!state[k]) delete state._strikes[k]
   }
+  pruneStats(state)
+}
+// _stats 跨会话永久累积,只留最近 STATS_KEEP 个会话的计数(防 store 文件无限膨胀)
+function pruneStats(state: any): void {
+  const st = state._stats
+  if (!st) return
+  const keys = Object.keys(st)
+  if (keys.length <= STATS_KEEP) return
+  keys.sort((a, b) => (st[a]?._at ?? 0) - (st[b]?._at ?? 0))
+  for (const k of keys.slice(0, keys.length - STATS_KEEP)) delete st[k]
 }
 
 // ============================ 六模块 ============================
@@ -215,8 +239,8 @@ async function readDedup($: any, e: any): Promise<string | null> {
   if (path === undefined || e?.tool_input?.pages !== undefined) return null
   const st = await fileStat($, path)
   if (!st) return null
-  const ctx = ctxKey(e)
-  const session = e.session_id ?? 'default'
+  const session = await sessionId($, e)
+  const ctx = ctxKey(e, session)
   const want = wantedRange(e)
   const state = await readState($)
   const rec = state[ctx]?.[path]
@@ -251,7 +275,7 @@ async function recordRead($: any, e: any): Promise<void> {
   if (path === undefined) return
   const st = await fileStat($, path)
   if (!st) return
-  const ctx = ctxKey(e)
+  const ctx = ctxKey(e, await sessionId($, e))
   const state = await readState($)
   const sess = state[ctx] ?? {}
   const rec = sess[path]
@@ -271,7 +295,7 @@ async function recordRead($: any, e: any): Promise<void> {
 
 // markCodingActivity:改动类工具落时间戳(供升级提醒的粘性窗口)
 async function markCodingActivity($: any, e: any): Promise<void> {
-  const session = e.session_id ?? 'default'
+  const session = await sessionId($, e)
   const state = await readState($)
   const sess = state[session] ?? {}
   sess._codingAt = Date.now()
@@ -284,7 +308,7 @@ async function markCodingActivity($: any, e: any): Promise<void> {
 async function trimOutput($: any, e: any): Promise<any | null> {
   const resp = e.tool_response
   if (resp == null) return null
-  const session = e.session_id ?? 'default'
+  const session = await sessionId($, e)
   const tool = toolNameOf(e)
   let collapsed = 0
   let trimmedChars = 0
@@ -364,7 +388,7 @@ function tierAdvice(cfg: Cfg): { stay: string; up: string } {
 async function modelPolicy($: any, e: any, cfg: Cfg): Promise<string | null> {
   const model = e.model
   if (typeof model !== 'string' || model === '') return null
-  await setSessionModel($, e.session_id ?? 'default', model)
+  await setSessionModel($, await sessionId($, e), model)
   const adv = tierAdvice(cfg)
   return isProModel(cfg, model)
     ? `[cc-token-optimizer] 当前 Pro 档(输出 ${cfg.pricing.pro.idle.out} 元/M)。` + adv.stay
@@ -374,7 +398,7 @@ async function modelPolicy($: any, e: any, cfg: Cfg): Promise<string | null> {
 async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalContext: string; toast?: string } | null> {
   const prompt = e.prompt
   if (typeof prompt !== 'string' || prompt.trim() === '') return null
-  const session = e.session_id ?? 'default'
+  const session = await sessionId($, e)
   const state = await readState($)
   const up = cfg.upgrade
   const lenOk = prompt.length >= (up.minPromptChars ?? 120)
@@ -423,7 +447,7 @@ function preModelSwitch(cfg: Cfg, e: any): string | null {
 async function postModelSwitch($: any, e: any, cfg: Cfg): Promise<{ additionalContext: string; toast: string } | null> {
   const to = e.to_model
   if (typeof to !== 'string') return null
-  await setSessionModel($, e.session_id ?? 'default', to)
+  await setSessionModel($, await sessionId($, e), to)
   const adv = tierAdvice(cfg)
   const pro = isProModel(cfg, to)
   return pro

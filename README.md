@@ -65,7 +65,7 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
 | 文件 | 作用 |
 |---|---|
 | `tool-gate.mjs` | 两档工具裁剪:改 `tiers.json` 名单后 `node tool-gate.mjs apply` 写入生效配置(均先自动备份,留 3 份),重启会话生效;`list` 只读对照,`enable <tool>` 召回 |
-| `stats.mjs` | 汇总 `<CLAUDE_CONFIG_DIR>/token-optimizer/state.json` 各会话拦截/裁剪/折叠计数与存档体积,估算累计省 token(`--json` 供脚本消费) |
+| `stats.mjs` | 汇总各会话拦截/裁剪/折叠计数与存档体积,估算累计省 token(`--json` 供脚本消费)。数据源:v0.2.0+ 读宿主插件 KV `<配置目录>/plugins/store/cc-token-optimizer*.json` 的 `guard-state`,并合并 Node 版时代的 `<配置目录>/token-optimizer/state.json`;存档体积把插件目录内的 `.archive/` 与旧位置一并计入 |
 
 > `tool-gate` 的落点(2026-10 实测定型,CC 2.1.292):`<配置目录>/agents/tool-gate.md` 的 `disallowedTools`(主线程工具真实移除)+ settings.json 的 `"agent": "tool-gate"` 键(裸启动/任意目录自动生效,无需改启动方式)。**该 agent 文件 body 必须保持为空**:非空 prompt 会整个替换默认系统提示。CC 升级后建议复验(新会话问"列出你此刻的工具名",对照名单是否消失)。
 
@@ -80,7 +80,7 @@ AbovePrompt 悬浮条:轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 
 会先问是否添加该 marketplace(`y`),再选作用域(推荐 `user`,对所有会话生效)。**装完即用,不需要动 `settings.json`,也不需要 `node`**:
 
 - 六个模块(readDedup / outputTrim / coldStartGuard / modelDirector 等)注册在插件内部的 `hooks/tokenGuard.ts`,随插件一起加载
-- 状态存在宿主管理的 `$.state` 里(不再是磁盘上的 `state.json`)
+- 状态存在宿主管理的 `$.store` 里(跨会话与热重载都在;落在 `<配置目录>/plugins/store/cc-token-optimizer*.json`)。**不是 `$.state`** —— 那是"held by the host for the session"的会话级内存,会话一结束统计就蒸发(v0.2.0 踩过这个坑,0.2.1 修)
 - 配置读插件自带的 `config.json`,缺失或损坏时回退内置默认,不会报错
 
 更新:

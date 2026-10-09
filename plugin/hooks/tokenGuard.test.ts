@@ -2,7 +2,7 @@
 // 覆盖:readDedup 的拦截/放行/逃生/fail-open、outputTrim 的裁剪、coldStartGuard 的注入、
 //       modelDirector 的触发。
 //
-// 测试的 bottom hooks 代表引擎:虚拟 fs / state / ui,以及各 classic 事件的空实现
+// 测试的 bottom hooks 代表引擎:虚拟 fs / store / session / ui,以及各 classic 事件的空实现
 //(引擎要求"插件之下必须有人应答该事件",否则抛 HooksError)。
 // Read 的路径走 $.tool.call —— 与真实会话一致(recordRead 挂在同一条 hook 里)。
 import { test, expect } from 'claude-code/testing'
@@ -11,8 +11,9 @@ type FsFile = { text: string; mtimeMs: number; size: number }
 
 const setupGuard = (on: any) => {
   const files = new Map<string, FsFile>()
-  const state = new Map<string, unknown>()
+  const store = new Map<string, unknown>()
   const toasts: string[] = []
+  let session = 'sess-1' // 可切换:用来验证跨会话分桶
   const pick = (e: any): string => (typeof e === 'string' ? e : String(e?.path ?? ''))
   // 路径形态不确定,只放一个文件时按"唯一文件"兜底,不影响测试语义
   const lookup = (e: any): FsFile | undefined => files.get(pick(e)) ?? [...files.values()][0]
@@ -30,13 +31,14 @@ const setupGuard = (on: any) => {
   on('fs.write', () => ({ value: undefined }))
   on('fs.list', () => ({ value: [] }))
 
-  let version = 0
-  on('state.get', (_$: any, e: any) => ({ value: { value: state.get(`${e.plugin}:${e.key}`), version } }))
-  on('state.set', (_$: any, e: any) => {
-    state.set(`${e.plugin}:${e.key}`, e.value)
-    version += 1
-    return { value: { isSet: true, version } }
+  // 状态走 $.store(跨会话 KV)。引擎约定:bottom 返回 { value: X } ⇒ API 返回 X。
+  on('store.get', (_$: any, e: any) => ({ value: store.get(e.key) }))
+  on('store.set', (_$: any, e: any) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
   })
+  // 会话 id:mod 的 tool.call 载荷不带 session_id,插件必须从 $.session.id() 取(见 sessionId())
+  on('session.id', () => ({ value: session }))
   on('ui.toast', (_$: any, e: any) => {
     toasts.push(typeof e === 'string' ? e : String(e?.text ?? ''))
     return { value: undefined }
@@ -52,7 +54,7 @@ const setupGuard = (on: any) => {
   // 引擎执行工具后的回传(代表真实工具)
   on('tool.call', () => ({ result: { text: 'file content' } }))
 
-  return { files, state, toasts }
+  return { files, store, toasts, setSession: (s: string) => { session = s } }
 }
 
 const readArgs = (path: string, id: string, offset = 1, limit = 2000) => ({
@@ -174,4 +176,23 @@ test('modelDirector:长提示也算命中(长度启发式)', async ($, on) => {
   setupGuard(on)
   const r = await $.classic.UserPromptSubmit({ prompt: '请'.repeat(200) })
   expect(JSON.stringify(r)).toMatch(/长提示/)
+})
+
+// —— 状态迁移回归:必须落 $.store(跨会话),不能再退回会话级 $.state ——
+test('state:已读记录写进 $.store 的 guard-state', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/x.ts', { text: 'x'.repeat(20), mtimeMs: 1000, size: 20 })
+  await $.tool.call(readArgs('/x.ts', 'tu1'))
+  const held = b.store.get('guard-state') as any
+  expect(held).toBeTruthy()
+  expect(JSON.stringify(held)).toMatch(/\/x\.ts/)
+})
+
+test('state:不同会话互不污染(会话桶按 $.session.id() 分)', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/x.ts', { text: 'x'.repeat(20), mtimeMs: 1000, size: 20 })
+  await $.tool.call(readArgs('/x.ts', 'tu1')) // sess-1 读过
+  b.setSession('sess-2') // 换会话:新上下文里并没有这份内容,不该拦
+  const r = await $.tool.call(readArgs('/x.ts', 'tu2'))
+  expect(JSON.stringify(r)).not.toMatch(/无需重读/)
 })
