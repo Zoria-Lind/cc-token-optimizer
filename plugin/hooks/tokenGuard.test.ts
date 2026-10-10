@@ -55,6 +55,8 @@ const setupGuard = (on: any) => {
   on('classic.PostModelSwitch', () => ({}))
   // 引擎执行工具后的回传(代表真实工具)
   on('tool.call', () => ({ result: { text: 'file content' } }))
+  // turn.complete 的 bottom —— 事实式升档提醒的判据来自它的 usage.model(引擎报的实际作答模型)
+  on('turn.complete', () => ({ text: 'ok' }))
 
   return { files, store, toasts, setSession: (s: string) => { session = s }, setModel: (m: string | null) => { liveModel = m } }
 }
@@ -160,13 +162,15 @@ test('coldStartGuard:缓存未过期 → 不注入', async ($, on) => {
   expect(JSON.stringify(r)).not.toMatch(/提示缓存已过期/)
 })
 
-test('modelDirector:命中 coding 关键词 → 注入升档提醒 + 提醒用户', async ($, on) => {
+test('modelDirector:命中 coding 关键词 → 只静默提醒模型,不再给用户发预测式提示', async ($, on) => {
   const b = setupGuard(on)
   const r = await $.classic.UserPromptSubmit({ prompt: '帮我重构这个模块的架构设计' })
   // 没有 config.json ⇒ 内置默认 skillName 为空 ⇒ 通用措辞:只建议 /model 切档,不点名技能
   expect(JSON.stringify(r)).toMatch(/\/model deepseek-v4-pro/)
   expect(JSON.stringify(r)).not.toMatch(/Skill/)
-  expect(b.toasts.length).toBeGreaterThan(0)
+  // 2026-10-10:旧的用户侧提示既误报(口语词命中)又误述(那一刻并没切档,切档得靠模型真去调技能),
+  // 用户反馈"搞得人心里很紧张" ⇒ 已删;用户侧提醒改走事实式 proNotice(见文末用例)
+  expect(b.toasts.length).toBe(0)
 })
 
 test('modelDirector:普通短句 → 不打扰', async ($, on) => {
@@ -265,6 +269,17 @@ test('modelDirector:长文本但无关键词、近期无改动 → 不打扰(长
   const r = await $.classic.UserPromptSubmit({ prompt: '请'.repeat(200) })
   expect(JSON.stringify(r)).not.toMatch(/Skill|\/model deepseek/)
   expect(b.toasts.length).toBe(0)
+})
+
+test('关键词表:日常口语词不再触发,高精度词仍触发(2026-10-10 由 43 项收紧到 19 项)', async ($, on) => {
+  const b = setupGuard(on)
+  // 这几个词在"讨论插件/方案"时天天出现,旧表把它们当 coding 信号 ⇒ 纯讨论轮被误判
+  const r1 = await $.classic.UserPromptSubmit({ prompt: '我们讨论一下这个方案和接口的设计,还有模块依赖' })
+  expect(JSON.stringify(r1)).not.toMatch(/coding 信号|coding 流/)
+  expect(b.toasts.length).toBe(0)
+  // 高精度信号(几乎只出现在 coding 语境)仍应触发
+  const r2 = await $.classic.UserPromptSubmit({ prompt: '这里报错了,帮我调试一下' })
+  expect(JSON.stringify(r2)).toMatch(/coding 信号/)
 })
 
 // —— 状态迁移回归:必须落 $.store(跨会话),不能再退回会话级 $.state ——

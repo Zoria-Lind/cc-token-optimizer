@@ -19,7 +19,7 @@ One command to install: no `settings.json` edits, no Node. Claude Code 2.1.275+.
 | **outputTrim** | `PostToolUse` Bash/PowerShell | Folds runs of ≥3 identical lines; if the output is still over 5000 chars, the **full original is archived to disk first**, then head/tail samples are injected (1500+1500; 800+800 when the command failed). The model sees the archive path, never the trimmed body. |
 | **coldStartGuard** | `SessionStart` | A resumed session whose prompt cache has expired gets one line: context size, estimated re-cache cost, and "consider `/clear`". |
 | **modelDirector** | `SessionStart` · `UserPromptSubmit` · `tool.call` Edit/Write/NotebookEdit · `PreModelSwitch` · `PostModelSwitch` | Tier discipline: mechanical upgrade nudges + an **optional hard gate** + transparent switch cost (see below). |
-| **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **cost (peak/off-peak, priced for the current tier, with a Pro marker)**; the command adds a three-way cost breakdown. |
+| **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **cost (peak/off-peak, priced per turn by the model that actually answered — a mixed tier is marked with the Pro portion)**; the command adds a three-way cost breakdown and a per-tier split. |
 | **`tools/stats.mjs`** | manual | Sums denials, trims, folded lines and archive size across sessions, and estimates tokens saved. |
 
 ## Install
@@ -51,7 +51,8 @@ The resident tier comes from `defaultTier` in `plugin/config.json`, and the disc
 Events:
 
 - **`SessionStart`** — records the current model and injects the tier discipline (tier = cheap: "suggest upgrading when unsure" / "switch back when done"; tier = pro: the reverse).
-- **`UserPromptSubmit`** — mechanical detection over 43 coding keywords / file suffixes (see `config.json`). **Prompt length alone never triggers** (pasting a webpage or a log must not cause a false upgrade), plus a **sticky window**: if code was edited recently, follow-up turns within 30 minutes nudge regardless of text. On a hit: ① the model gets a conditional instruction ("if you are not already on the strong tier, call the upgrade skill named in your `/config` before you start"), ② you get a `systemMessage` (10-minute cooldown, suppressed while the recorded tier is already Pro). **Upgrades are driven mechanically, not by model self-assessment** — that is the fix for the self-reference trap.
+- **`UserPromptSubmit`** — mechanical detection over 19 high-precision coding keywords / file suffixes (see `config.json`; tightened 2026-10-10 from 43: everyday words such as "plan"/"interface"/"design" were removed, so discussing a design no longer misfires). **Prompt length alone never triggers** (pasting a webpage or a log must not cause a false upgrade), plus a **sticky window**: if code was edited recently, follow-up turns within 30 minutes nudge regardless of text. On a hit: ① the model gets a conditional instruction ("if you are not already on the strong tier, call the upgrade skill named in your `/config` before you start"), ② that is all — **no predictive message to you** (removed 2026-10-10: it fired on everyday words such as "plan"/"interface" *and* announced "this turn runs on Pro" at a moment when nothing had switched yet; users reported it as alarming). **Upgrades are driven mechanically, not by model self-assessment** — that is the fix for the self-reference trap.
+- **`turn.complete` (fact-based upgrade notice, 2026-10-10)** — the criterion is the model the engine reports as having actually answered that turn (`usage.model`): if it is a Pro-tier model while the session's tier is not Pro, a request really did run on the strong tier, so you get **one** notice (cooldown `cooldownMin` per session; never when the session is already permanently Pro; subagent turns skipped). **This is the only user-facing upgrade notice** — nothing is announced on prediction.
 - **Hard gate (`tool.call` on Edit/Write/NotebookEdit, opt-in)** — before the model calls an editing tool it has necessarily already reasoned a turn, so *it deciding to edit code is the coding signal* — the only reliable automatic one when the user said nothing and the model itself is unsure. On the **first code-file modification of a turn** the call is **denied once** (the model must activate your upgrade skill and retry; the rest of the turn then runs on the strong tier — the cost is one extra round trip). Judgement and the edges you will actually hit:
   - **Code files only, by extension.** Besides source files, `.json/.yaml/.toml/.ini/.ps1` and friends **count as code**; **`.md/.txt`-style docs pass** (otherwise editing a README or a memory file would burn a round trip for nothing).
   - **Creating a code file with Write trips it too** — existence is not checked; writing a new `.ts` is still "editing code".
@@ -103,12 +104,13 @@ Events:
 - **readDedup** compares mtime + size rather than content hashes (a same-second, same-size rewrite is missed), and recent Claude Code builds already answer whole-file re-reads natively — the remaining value is partial-overlap merging and long-span re-reads.
 - A denied read or edit costs one failed round while the model retries; hence the 3-strike escape hatch on reads.
 - Status-bar figures are aggregated from `turn.complete`, and `/compact` does not reset the running totals.
+- **Costs are priced per turn by the model the engine reports as having answered** (`usage.model`): Pro-served tokens at Pro rates, the rest at the cheap ones; a mixed session shows the Pro portion separately. Ledgers written before v0.2.5 carry no per-tier split, so that history reads at cheap rates — don't compare figures across that line.
 - `config.json`'s `_comment` documents every key's exact semantics, including the caveats above — it ships with the plugin.
 
 ## Verify
 
 ```sh
-claude plugin test plugin      # 30 checks: denial / escape hatch / trimming / folding / hard gate / state isolation
+claude plugin test plugin      # 40 checks: denial / escape hatch / trimming / folding / hard gate / state isolation / pricing
 claude plugin validate plugin --strict
 ```
 

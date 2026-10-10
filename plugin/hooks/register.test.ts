@@ -28,6 +28,14 @@ const setup = (on: any) => {
   }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('turn.complete', () => ({ text: 'ok' }))
+  // 事实式升档提醒的判据与出口:会话档位($.session.model —— 实测=会话基础档)+ 给用户的提示
+  const toasts: string[] = []
+  let sessionModel: string | null = 'deepseek-v4-flash'
+  on('session.model', () => ({ value: sessionModel }))
+  on('ui.toast', (_$: any, e: any) => {
+    toasts.push(typeof e === 'string' ? e : String(e?.text ?? ''))
+    return { value: undefined }
+  })
   // 虚拟 state(账本持久化的落点):Map 实现;插件的 $.state.get/set 沿链下到这里
   // (与 behavior-enhancer 测试同款形状:get 回 { value, version },set 回 { isSet, version })
   const state = new Map<string, unknown>()
@@ -39,7 +47,7 @@ const setup = (on: any) => {
     version += 1
     return { value: { isSet: true, version } }
   })
-  return { registered, state }
+  return { registered, state, toasts, setModel: (m: string | null) => { sessionModel = m } }
 }
 
 const start = async ($: any) => {
@@ -119,6 +127,87 @@ test('usage 缺失的轮次单独计数(诊断口径:区分"没收到事件"与"
   await turn($, { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 400, cache_creation_input_tokens: 0 }, undefined)
   const out = await runCmd($, 'token-status')
   expect(out.text).toMatch(/轮次: 1\(另有 usage 缺失 1 轮、子代理 0 轮,未计价\)/)
+})
+
+// —— 事实式升档提醒(2026-10-10):判据是 turn.complete 的 usage.model = 引擎报的**实际作答模型**
+//    ("the model of the last that counted"),不是对用户文本的预测。旧的预测式提示既误报(口语词命中)
+//    又误述(那一刻并没切档),用户反馈"搞得人心里很紧张" ⇒ 已删;用户侧只在真有请求走 Pro 时才出声 ——
+const proTurnUsage = (model: string) => ({
+  model, input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+})
+
+test('升档提醒:引擎报的实际作答是 Pro、会话档位是基础档 → 提醒一次', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
+  expect(b.toasts.join(' ')).toMatch(/有请求走 Pro 档/)
+})
+
+test('升档提醒:实际作答是基础档 → 不提醒', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  await turn($, proTurnUsage('deepseek-v4-flash'), undefined)
+  expect(b.toasts.length).toBe(0)
+})
+
+test('升档提醒:会话本来就常驻 Pro → 不提醒(没有"升"发生,免得每轮唠叨)', async ($, on) => {
+  const b = setup(on)
+  b.setModel('deepseek-v4-pro[1m]')
+  await start($)
+  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
+  expect(b.toasts.length).toBe(0)
+})
+
+test('升档提醒:子代理轮次不提醒(它按设计走基础档)', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), 'sub-1')
+  expect(b.toasts.length).toBe(0)
+})
+
+test('升档提醒:冷却内不重复(cooldownMin=10 分钟)', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
+  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
+  expect(b.toasts.length).toBe(1)
+})
+
+// —— 分账计价(2026-10-10):每轮按引擎报的**作答模型**归账,Pro 部分走 Pro 价目 ——
+//    此前是"整段会话按当前档位计价",于是升过档的日子成本显示偏低 ——
+const turnUsage = (model: string | undefined, input: number, output = 0) => ({
+  ...(model === undefined ? {} : { model }),
+  input_tokens: input, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+})
+
+test('分账计价:一轮基础档 + 一轮 Pro 档 → 各归各账,Pro 部分走 Pro 价', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  await turn($, turnUsage('deepseek-v4-flash', 1_000_000), undefined)
+  await turn($, turnUsage('deepseek-v4-pro[1m]', 1_000_000), undefined)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/档位构成: Pro ¥[1-9]/) // Pro 那轮按 Pro 价(空闲 4.5 / 高峰 9,故只断言"非零")
+  expect(out.text).toMatch(/Pro ¥[\d.]+\(1 轮\)/)
+  expect(out.text).toMatch(/基础档 ¥[1-9]/)
+  expect(out.text).toMatch(/基础档 ¥[\d.]+\(1 轮\)/)
+})
+
+test('分账计价:全基础档会话 → Pro 部分为 0 并标注「未升过档」', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  await turn($, turnUsage('deepseek-v4-flash', 1_000_000, 500), undefined)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/档位构成: Pro ¥0\.000\(0 轮\)/)
+  expect(out.text).toMatch(/本会话未升过档/)
+})
+
+test('分账计价:引擎没报模型 → 退回会话档位归账(fail-safe)', async ($, on) => {
+  const b = setup(on)
+  b.setModel('deepseek-v4-pro[1m]') // 会话档位本身是 Pro
+  await start($)
+  await turn($, turnUsage(undefined, 1_000_000), undefined)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/Pro ¥[1-9]/)
 })
 
 // 悬浮条(AbovePrompt)不做单元断言:测试框架要求 ui.render 的 bottom 返回真实树元素,

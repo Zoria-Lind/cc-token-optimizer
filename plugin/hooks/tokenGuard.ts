@@ -70,7 +70,7 @@ const DEFAULT_CONFIG: Cfg = {
   models: { cheap: 'deepseek-v4-flash', pro: 'deepseek-v4-pro[1m]' },
   currency: '¥',
   upgrade: {
-    keywords: ['设计', '架构', '重构', '方案', '决策', '算法', 'design', 'architecture', 'refactor', 'plan'],
+    keywords: ['重构', '编译', '报错', '调试', 'refactor', 'debug', 'bug', '.py', '.ts', '.tsx', '.js', '.mjs', '.jsx', '.ps1', '.sh', '.go', '.rs', '.java', '.cpp'],
     cooldownMin: 10,
     stickyMin: STICKY_DEFAULT_MIN,
     // 内置默认留空 = 通用措辞(任何供应商都说得通);插件自带的 config.json 填 'coding-pro'。
@@ -369,7 +369,7 @@ async function codingToolGate($: any, e: any): Promise<string | null> {
     ) {
       sess._forcedTurn = turn
       deny =
-        `[cc-token-optimizer] 本回合首次改动代码,但当前是基础档:请先调用 Skill 工具(${skill}) ` +
+        `[cc-token-optimizer] 本回合首次改动代码,而本会话档位是基础档:请先调用 Skill 工具(${skill}) ` +
         `让后续在强档执行(回合级、下一轮自动回落),然后**重试刚才那次调用** —— 只多花一次往返。`
     }
   }
@@ -471,8 +471,8 @@ async function modelPolicy($: any, e: any, cfg: Cfg): Promise<string | null> {
     ? `[cc-token-optimizer] 当前 Pro 档(输出 ${cfg.currency}${cfg.pricing.pro.idle.out}/M)。` + adv.stay
     : `[cc-token-optimizer] 当前基础档(输出 ${cfg.currency}${cfg.pricing.cheap.idle.out}/M)。` + adv.up
 }
-// UserPromptSubmit:机械检测 → 驱动回合级升档。返回 { additionalContext, toast? }
-async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalContext: string; toast?: string } | null> {
+// UserPromptSubmit:机械检测 → 驱动回合级升档。只给模型发**静默**指令,不给用户发预测式提示(见 proNotice)
+async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<string | null> {
   const prompt = e.prompt
   if (typeof prompt !== 'string' || prompt.trim() === '') return null
   const session = await sessionId($, e)
@@ -483,32 +483,14 @@ async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<{ additionalC
   // 长度不再单独触发(2026-10-09):阈值 120 字符时粘贴网页/日志必然命中,而"长"与"复杂任务"无关,
   // 误报的代价是用户白升 Pro —— 省钱插件让人多花钱是最糟的方向。只认关键词命中与粘性窗口。
   if (!kwHit && !codingFlow) return null
-  const model = state[session]?._model ?? null
   // 给模型的指令:条件式、每轮都给、不带冷却(档位判定交给模型读自己每轮的系统提示,不按 state 拦)
   const skill = effectiveSkill(cfg)
-  const additionalContext =
+  return (
     `[cc-token-optimizer] 本条命中${kwHit ? ' coding 信号' : ' coding 流(近期有代码改动)'}:` +
     (skill
       ? `若你当前不在 Pro 档,动手前先调用 Skill 工具(${skill})让本回合以 Pro 档执行(回合级、自动回落;改一行/加注释这类小事可不调用);已在 Pro 档则忽略本条。`
       : `若你当前不在 Pro 档,动手前建议用户 /model ${cfg.models.pro} 升档再动手(改一行/加注释这类小事可不升);已在 Pro 档则忽略本条。`)
-  // 给用户的提示:只对关键词命中发(粘性窗口下的短句续接只提醒模型、不打扰用户);带冷却;记录档位已是 Pro 时不发
-  const last = state[session]?._upgradeSugAt ?? 0
-  if (kwHit && !isProModel(cfg, model) && Date.now() - last >= (up.cooldownMin ?? 10) * 60_000) {
-    const s2 = await readState($)
-    const sess = s2[session] ?? {}
-    sess._upgradeSugAt = Date.now()
-    sess._at = Date.now()
-    s2[session] = sess
-    await writeState($, s2)
-    return {
-      additionalContext,
-      toast: skill
-        ? `[cc-token-optimizer] 本条判为 coding 任务,本回合按 Pro 档执行(下一轮自动回 ${cfg.models.cheap})。` +
-          `想让整段会话都用 Pro 就 /model ${cfg.models.pro};否则无需操作。`
-        : `[cc-token-optimizer] 本条判为 coding 任务。未配升级技能,请自行 /model ${cfg.models.pro} 切强档(下次启动自动回 ${cfg.models.cheap})。`,
-    }
-  }
-  return { additionalContext }
+  )
 }
 // PreModelSwitch:切换成本透明(给用户)
 function preModelSwitch(cfg: Cfg, e: any): string | null {
@@ -575,10 +557,7 @@ export const register: Register = (on, options) => {
       const cfg = await loadConfig($)
       await markTurn($, e) // 回合标记:硬升档闸每回合最多强制一次
       const out = await upgradeHeuristic($, e, cfg)
-      if (out) {
-        await toast($, out.toast)
-        return { additionalContext: [out.additionalContext] }
-      }
+      if (out) return { additionalContext: [out] }
     } catch { /* fail-open */ }
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : undefined))
