@@ -244,6 +244,13 @@ test('硬升档闸:没配 skillName → 不拦,但粘性窗口照记', async ($,
   expect(JSON.stringify(held)).toMatch(/_codingAt/)
 })
 
+test('升档粘性窗口:改文档(.md)不落 _codingAt —— 纯文档轮不该被判成 coding 流', async ($, on) => {
+  const b = setupGuard(on)
+  await $.tool.call({ tool: 'Edit', file_path: '/notes.md', old_string: 'a', new_string: 'b', tool_use_id: 'md-sticky' })
+  const held = b.store.get('guard-state') as any
+  expect(JSON.stringify(held)).not.toMatch(/_codingAt/)
+})
+
 test('硬升档闸:改文档(.md)不拦,无扩展名的代码文件(Dockerfile)按 basename 判', async ($, on) => {
   const b = setupGuard(on)
   b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })

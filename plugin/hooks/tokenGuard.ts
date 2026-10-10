@@ -347,7 +347,10 @@ async function codingToolGate($: any, e: any): Promise<string | null> {
   const state = await readState($)
   const sid = session
   const sess = state[sid] ?? {}
-  sess._codingAt = Date.now()
+  // 只认**代码文件**:改 README/.json 不该算"近期改过代码"(2026-10-10 修 —— 这个时间戳曾经无条件写,
+  // 于是写文档也会让粘性窗口连续 stickyMin 分钟把纯文档轮判成 coding 流,实测把不该升档的轮也推上强档)
+  const isCode = isCodePath(filePathOf(e))
+  if (isCode) sess._codingAt = Date.now()
   sess._at = Date.now()
   state[sid] = sess
   let deny: string | null = null
@@ -361,7 +364,7 @@ async function codingToolGate($: any, e: any): Promise<string | null> {
     // 只拦代码文件(改文档不拦);档位未知时不拦:拦了却给不出可行的下一步,比不拦更糟(fail-open)
     if (
       (sess._forcedTurn ?? -1) !== turn &&
-      isCodePath(filePathOf(e)) &&
+      isCode &&
       typeof live === 'string' && live !== '' && !isProModel(cfg, live)
     ) {
       sess._forcedTurn = turn
