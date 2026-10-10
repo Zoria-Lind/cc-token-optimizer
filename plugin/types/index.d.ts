@@ -20,6 +20,14 @@ export type UsageTotals = {
   output: number
   cacheRead: number
   cacheCreation: number
+  /** 按**真实档位**分账(2026-10-10):本会话里由 Pro 档模型作答的那部分 token。
+   *  基础档部分 = 总量 − pro 部分;旧账本没有这些字段 ⇒ 视为 0(整段按基础档计价,与旧口径一致)。 */
+  proInput: number
+  proOutput: number
+  proCacheRead: number
+  proCacheCreation: number
+  /** 由 Pro 档作答的主会话轮次。 */
+  proTurns: number
   /** 本会话首轮计数时刻(ms)。 */
   firstAt: number | null
   /** 最近一轮计数时刻(ms)。 */
@@ -40,14 +48,22 @@ export type GuardBucket = {
   _at?: number
   /** 最近改过代码的时刻(升档粘性窗口用)。 */
   _codingAt?: number
-  /** 上次观测到的模型名。 */
+  /** 上次观测到的模型名(**会话基础档**;技能的回合级切档看不见)。 */
   _model?: string
-  /** 上次向用户发升档提醒的时刻(冷却用)。 */
-  _upgradeSugAt?: number
-  /** 本会话的回合序号(每次用户发言 +1);硬升档闸据此保证每回合最多强制一次。 */
-  _turn?: number
-  /** 上次"硬升档闸"强制发生在哪一回合(与 _turn 比对;相等=本回合已强制过)。 */
-  _forcedTurn?: number
+  /** 回合边界计数(2026-10-11):**只由 turn.complete 自增**(register.tsx 代 hooks 层落笔)。
+   *  硬升档闸按它判断"本回合是否已升过档 / 已强制过"。
+   *  ⚠ 别拿 UserPromptSubmit 的计数当回合标识:同一回合内会**再次触发它**(实测:子 agent 的
+   *  hand-back 以 user 角色消息注入),序号被顶高 ⇒ 已升档的回合仍被白拦一次(2026-10-11 现场复现)。 */
+  _epoch?: number
+  /** 升档时刻(2026-10-10):`classic.PostToolUse(Skill)` 从引擎报的解析模型确认"本回合走了强档"。
+   *  账本(register.tsx guardProHit)按**时间窗**归属;闸看的是同一刻的 `_proEpoch`。 */
+  _proAt?: number
+  /** 升档时 `_epoch` 的值 ⇒ `_proEpoch === _epoch` 即"本回合已升过档"(闸据此放行)。 */
+  _proEpoch?: number
+  /** 上次向用户发升档提醒的时刻(冷却用;只压提醒,不压 `_proAt` 的记账)。 */
+  _proNoticeAt?: number
+  /** 硬升档闸上次强制发生的 `_epoch` ⇒ `=== _epoch` 即"本回合已强制过"(每回合最多拦一次)。 */
+  _forcedEpoch?: number
 } & Record<string, unknown>
 
 /**

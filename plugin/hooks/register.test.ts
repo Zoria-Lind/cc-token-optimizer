@@ -6,6 +6,7 @@
 // 可观测面:聚合结果经 /token-status 命令输出断言;悬浮条断言"0 轮透传 / 有数据画树"。
 
 import { test, expect } from 'claude-code/testing'
+import { isPeakAt } from './register'
 
 // CC 2.1.293:testing 侧把 $.command.run 收窄为 CommandRunInput(要求 origin/presentation
 // 这两个只有引擎才设置的字段),而插件侧签名是 CommandRunArgs(只要 command,args 可选)。
@@ -36,6 +37,15 @@ const setup = (on: any) => {
     toasts.push(typeof e === 'string' ? e : String(e?.text ?? ''))
     return { value: undefined }
   })
+  // guard-state(hooks 层落的升档事实 `_proAt`;$.store 是**裸字符串键**,与 tokenGuard 同源)+ 真会话 id
+  const guardStore = new Map<string, unknown>()
+  on('store.get', (_$: any, e: any) => ({ value: guardStore.get(e.key) }))
+  on('store.set', (_$: any, e: any) => {
+    guardStore.set(e.key, e.value)
+    return { value: undefined }
+  })
+  let sessionId = 'sess-A'
+  on('session.id', () => ({ value: sessionId }))
   // 虚拟 state(账本持久化的落点):Map 实现;插件的 $.state.get/set 沿链下到这里
   // (与 behavior-enhancer 测试同款形状:get 回 { value, version },set 回 { isSet, version })
   const state = new Map<string, unknown>()
@@ -47,14 +57,14 @@ const setup = (on: any) => {
     version += 1
     return { value: { isSet: true, version } }
   })
-  return { registered, state, toasts, setModel: (m: string | null) => { sessionModel = m } }
+  return { registered, state, toasts, guardStore, setSessionId: (s: string) => { sessionId = s }, setModel: (m: string | null) => { sessionModel = m } }
 }
 
 const start = async ($: any) => {
   await $.session.start({ cwd: '/pkg', surface: 'terminal', isInteractive: true })
 }
-const turn = async ($: any, usage: any, agentId: string | undefined) => {
-  await $.turn.complete({ answer: 'ok', usage, agentId })
+const turn = async ($: any, usage: any, agentId: string | undefined, durationMs?: number) => {
+  await $.turn.complete({ answer: 'ok', usage, agentId, durationMs })
 }
 
 test('turn.complete 聚合主会话 usage,subagent 轮次不计入', async ($, on) => {
@@ -129,48 +139,59 @@ test('usage 缺失的轮次单独计数(诊断口径:区分"没收到事件"与"
   expect(out.text).toMatch(/轮次: 1\(另有 usage 缺失 1 轮、子代理 0 轮,未计价\)/)
 })
 
-// —— 事实式升档提醒(2026-10-10):判据是 turn.complete 的 usage.model = 引擎报的**实际作答模型**
-//    ("the model of the last that counted"),不是对用户文本的预测。旧的预测式提示既误报(口语词命中)
-//    又误述(那一刻并没切档),用户反馈"搞得人心里很紧张" ⇒ 已删;用户侧只在真有请求走 Pro 时才出声 ——
+// —— 档位归属(2026-10-10 重做):直连 DeepSeek 时 `usage.model` 报的是**会话档位**
+//    (实测:真跑在 Pro 上却报 0 轮;近 24h 共 548 条日志零条 pro)⇒ 判据换成 hooks 层落的机械事实
+//    `_proAt`(Skill 工具结果里引擎报的解析模型,见 tokenGuard.ts 的 markSkillUpgrade);
+//    `usage.model` 退为 OR 兜底(官方 Anthropic 等会如实报的宿主)。用户侧提醒已移到 hooks 层 —— 升档当场弹。
 const proTurnUsage = (model: string) => ({
   model, input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
 })
+// 预置 hooks 层落的升档标记(会话桶 'sess-A' 与 setup 里 $.session.id() 的默认值一致)
+const proMark = (b: any, at: number) => b.guardStore.set('guard-state', { 'sess-A': { _proAt: at, _at: at } })
 
-test('升档提醒:引擎报的实际作答是 Pro、会话档位是基础档 → 提醒一次', async ($, on) => {
+test('档位归属:usage.model 报基础档、但本回合有升档标记 → 记 Pro 轮(0.2.5 在这里恒记基础档)', async ($, on) => {
   const b = setup(on)
   await start($)
-  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
-  expect(b.toasts.join(' ')).toMatch(/有请求走 Pro 档/)
+  proMark(b, Date.now())
+  await turn($, proTurnUsage('deepseek-v4-flash'), undefined, 30000)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/Pro ¥[\d.]+\(1 轮\)/) // 100 输入 + 10 输出都归 Pro 桶(金额四舍五入后 ≈¥0.001)
+  expect(out.text).not.toMatch(/本会话未升过档/)
 })
 
-test('升档提醒:实际作答是基础档 → 不提醒', async ($, on) => {
+test('档位归属:升档标记落在本回合时间窗之外 → 不记 Pro(Pro 之后的续接回合不被误记)', async ($, on) => {
   const b = setup(on)
   await start($)
-  await turn($, proTurnUsage('deepseek-v4-flash'), undefined)
-  expect(b.toasts.length).toBe(0)
+  proMark(b, Date.now() - 60_000) // 一分钟前的升档:不属于本回合
+  await turn($, proTurnUsage('deepseek-v4-flash'), undefined, 5_000) // 本回合只有 5 秒
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/档位构成: Pro ¥0\.000\(0 轮\)/)
 })
 
-test('升档提醒:会话本来就常驻 Pro → 不提醒(没有"升"发生,免得每轮唠叨)', async ($, on) => {
+test('档位归属:标记属于别的会话 → 不串账', async ($, on) => {
   const b = setup(on)
-  b.setModel('deepseek-v4-pro[1m]')
   await start($)
-  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
-  expect(b.toasts.length).toBe(0)
+  b.guardStore.set('guard-state', { 'sess-OTHER': { _proAt: Date.now(), _at: Date.now() } })
+  await turn($, proTurnUsage('deepseek-v4-flash'), undefined, 30000)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/档位构成: Pro ¥0\.000\(0 轮\)/)
 })
 
-test('升档提醒:子代理轮次不提醒(它按设计走基础档)', async ($, on) => {
+test('档位归属:usage.model 自己就报 Pro → 记 Pro(不依赖标记;如实报模型的宿主走这条)', async ($, on) => {
   const b = setup(on)
   await start($)
-  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), 'sub-1')
-  expect(b.toasts.length).toBe(0)
+  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined, 30000)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/Pro ¥[\d.]+\(1 轮\)/)
 })
 
-test('升档提醒:冷却内不重复(cooldownMin=10 分钟)', async ($, on) => {
+test('档位归属:子代理轮次不进账本(它按设计走基础档)', async ($, on) => {
   const b = setup(on)
   await start($)
-  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
-  await turn($, proTurnUsage('deepseek-v4-pro[1m]'), undefined)
-  expect(b.toasts.length).toBe(1)
+  proMark(b, Date.now())
+  await turn($, proTurnUsage('deepseek-v4-flash'), 'sub-1', 30000)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/轮次: 0/)
 })
 
 // —— 分账计价(2026-10-10):每轮按引擎报的**作答模型**归账,Pro 部分走 Pro 价目 ——
@@ -213,3 +234,22 @@ test('分账计价:引擎没报模型 → 退回会话档位归账(fail-safe)', 
 // 悬浮条(AbovePrompt)不做单元断言:测试框架要求 ui.render 的 bottom 返回真实树元素,
 // 而元素构造器只存在于引擎内部,测试 bottom 拿不到。其验证由三层兜底:
 // engine validate(API 形状)+ 热重载零失败(引擎加载)+ /token-status(数据路径)+ 用户肉眼(输入框上方)。
+
+// 高峰判定:固定按 UTC+8(北京),与本机时区无关。
+// ⚠ 旧实现用 getHours()/getDay() = 本机本地时区,而价目表与 holidays 都是北京口径
+// ⇒ 非中国时区的机器会静默错价(2026-10-11 修)。用固定时刻打靶(北京时间 = UTC+8)。
+test('高峰判定按北京时间(UTC+8)算,与本机时区无关', () => {
+  // 2026-10-12 是周一:UTC 01:00 = 北京 09:00(高峰起点),UTC 00:59 = 北京 08:59(还空闲)
+  expect(isPeakAt([], Date.parse('2026-10-12T01:00:00Z'))).toBe(true)
+  expect(isPeakAt([], Date.parse('2026-10-12T00:59:00Z'))).toBe(false)
+  // 午休空档:北京 12:00 与 13:59 空闲,14:00 起再高峰
+  expect(isPeakAt([], Date.parse('2026-10-12T04:00:00Z'))).toBe(false)
+  expect(isPeakAt([], Date.parse('2026-10-12T05:59:00Z'))).toBe(false)
+  expect(isPeakAt([], Date.parse('2026-10-12T06:00:00Z'))).toBe(true)
+  // 北京 18:00 收工
+  expect(isPeakAt([], Date.parse('2026-10-12T10:00:00Z'))).toBe(false)
+  // 周末(北京周六 10:00)全天空闲
+  expect(isPeakAt([], Date.parse('2026-10-17T02:00:00Z'))).toBe(false)
+  // 节假日按**北京日期**比:同一 UTC 时刻落在北京 10-12 ⇒ 命中 holidays
+  expect(isPeakAt(['2026-10-12'], Date.parse('2026-10-12T02:00:00Z'))).toBe(false)
+})

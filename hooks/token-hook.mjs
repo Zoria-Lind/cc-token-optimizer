@@ -13,6 +13,13 @@
 //                    自指坑(cheap 模式必读):升级触发器必须在人——若交给模型自评,便宜档不知道自己
 //                    便宜在哪,会漏升级、做砸了也报告不出来(2026-10-07 实测踩过)。
 // 铁律:任何异常静默放行(fail-open),绝不阻断工具。
+//
+// ⚠ **已废弃**(2026-10-09 起):全部功能已并入 `plugin/`(随插件安装,不再需要本文件与 settings.json)。
+//    本文件只作历史参照;**不要与插件同时挂载** —— 两者处理同样的事件,会双计双裁。
+//    已知过时点:①第 35 行 `CODING_TOOLS` 仍列 `MultiEdit`,而 CC 2.1.293 的工具表里已没有它
+//    (matcher 是类型化的,会被拒;现役版 tokenGuard.ts 已剔除);②下面文档里的 `settings.json`
+//    示例只挂了 `PreToolUse: [{matcher:"Read"}]`,照抄的话粘性窗口不会触发 —— 改动类工具
+//    (`Edit|Write|NotebookEdit`)那条也要挂上同一脚本。
 
 import { readFileSync, writeFileSync, statSync, mkdirSync, readdirSync, unlinkSync, rmdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
