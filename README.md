@@ -2,13 +2,40 @@
 
 **English** · [中文](README.zh-CN.md)
 
+[![Listed on ClaudePluginHub](https://www.claudepluginhub.com/badge/zoria-lind-cc-token-optimizer-plugin)](https://www.claudepluginhub.com/plugins/zoria-lind-cc-token-optimizer-plugin)
+
 A Claude Code plugin that cuts what a session actually costs — read de-duplication, output trimming, cache-stall nudges, and a live cost / cache-hit bar above the prompt.
 
 ```
 /plugin install cc-token-optimizer --marketplace Zoria-Lind/cc-token-optimizer
 ```
 
-One command to install: no `settings.json` edits, no Node. Claude Code 2.1.275+.
+One command to install: no `settings.json` edits, no Node. Claude Code 2.1.275+ (developed and tested against **2.1.296**).
+
+## Install
+
+It asks whether to add the marketplace (`y`), then for a scope — `user` applies it to every session. Nothing else to set up:
+
+- The eight hook registrations live in the plugin itself (`plugin/hooks/tokenGuard.ts`; the status bar and `/token-status` are registered in `plugin/hooks/register.tsx`), and load with it.
+- There are **two** stores, with different lifetimes:
+  - The hook layer's `guard-state` (read records, trim counters, tier facts) lives in the host's plugin KV — `<config dir>/plugins/store/cc-token-optimizer*.json` — so it survives across sessions and hot reloads. It is **not** `$.state` (v0.2.0 shipped that mistake; fixed in 0.2.1).
+  - The **cost ledger** behind the status bar and `/token-status` (rounds, tokens, the per-tier cost split) lives in `$.state`, which is session-scoped by design: it survives a hot reload, but a new session or `/clear` starts from zero. "¥0.40" means *this session*, not a lifetime total.
+- Config is read from the plugin's own `config.json`; a missing or corrupt file falls back to built-in defaults instead of erroring.
+
+Update:
+
+```
+/plugin marketplace update zoria-plugins
+/plugin update cc-token-optimizer@zoria-plugins
+```
+
+Turning it off — the `/plugin` manager (disable or uninstall), or from a shell:
+
+```
+claude plugin disable cc-token-optimizer
+```
+
+Nothing else on your machine is touched: the only things it writes are its own store under `<config dir>/plugins/store/`, and trimmed-output archives inside its own plugin directory (`plugin/.archive/<session>/`).
 
 ## Modules
 
@@ -21,29 +48,36 @@ One command to install: no `settings.json` edits, no Node. Claude Code 2.1.275+.
 | **modelDirector** | `SessionStart` · `UserPromptSubmit` · `tool.call` Edit/Write/NotebookEdit · `PreModelSwitch` · `PostModelSwitch` | Tier discipline: mechanical upgrade nudges + an **optional hard gate** + transparent switch cost (see below). |
 | **tierFact** | `PostToolUse` Skill | Reads the resolved model out of the Skill tool's own result — the only trustworthy escalation signal against a direct DeepSeek endpoint — and when it is a Pro model records the fact (`_proAt` / `_proEpoch`) and toasts you **at the moment it happens**. Both the cost split and the hard gate read that fact. |
 | **compactReset** | `session.compact` | Drops the session's read records at a compaction: the harness clears old tool output out of context when it compacts, so every "you already read this" record is stale from that point on. `trigger: "precompute"` is skipped — it is the one dispatch that installs nothing. |
-| **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **cost (peak/off-peak, priced per turn by the model that actually answered — a mixed tier is marked with the Pro portion)**; the command adds a three-way cost breakdown and a per-tier split. |
+| **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **cost (peak/off-peak, priced per turn by the model that actually answered — a mixed tier is marked with the Pro portion)**; the command adds a three-way cost breakdown and a per-tier split. ⚠ **Session-cumulative, and the `¥` is spend — not savings** (see *What the numbers mean*). |
 | **`tools/stats.mjs`** | manual | Sums denials, trims, folded lines and archive size across sessions, and estimates tokens saved. |
 
-## Install
+## What the numbers mean
+
+Above every prompt — a real one, unedited:
+
+![the status bar above the prompt](docs/bar.png)
+
+The same line as text:
 
 ```
-/plugin install cc-token-optimizer --marketplace Zoria-Lind/cc-token-optimizer
+[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · ¥1.93·混合(Pro ¥1.39)
 ```
 
-Claude Code 2.1.275+. It asks whether to add the marketplace (`y`), then for a scope — `user` applies it to every session. Nothing else to set up:
-
-- The eight hook modules live in the plugin itself (`plugin/hooks/tokenGuard.ts`) and load with it.
-- There are **two** stores, with different lifetimes:
-  - The hook layer's `guard-state` (read records, trim counters, tier facts) lives in the host's plugin KV — `<config dir>/plugins/store/cc-token-optimizer*.json` — so it survives across sessions and hot reloads. It is **not** `$.state` (v0.2.0 shipped that mistake; fixed in 0.2.1).
-  - The **cost ledger** behind the status bar and `/token-status` (rounds, tokens, the per-tier cost split) lives in `$.state`, which is session-scoped by design: it survives a hot reload, but a new session or `/clear` starts from zero. "¥0.40" means *this session*, not a lifetime total.
-- Config is read from the plugin's own `config.json`; a missing or corrupt file falls back to built-in defaults instead of erroring.
-
-Update:
+`/token-status` prints the same ledger, with the breakdown (figures illustrative here):
 
 ```
-/plugin marketplace update zoria-plugins
-/plugin update cc-token-optimizer@zoria-plugins
+- 轮次: 8(另有 usage 缺失 0 轮、子代理 2 轮,未计价)
+- 成本(¥,按各轮真实档位分账 · 空闲价): ¥0.120 = 输入未命中 ¥0.030 + 缓存读 ¥0.040 + 输出 ¥0.050
+- 档位构成: Pro ¥0.080(1 轮)/ 基础档 ¥0.040(7 轮)
 ```
+
+The built-in labels are Chinese today (see *Honest edges*). Three things are worth stating outright, because the bar invites the wrong reading:
+
+- **That `¥` is what this session has actually spent so far** — cumulative, off-peak/peak, each turn priced at the tier it really ran on. It is **not** "you saved X".
+- **There is deliberately no savings figure anywhere.** "Saved" only means something against a counterfactual (e.g. *the same tokens, all on the pro tier*), and this plugin reports what the engine reports instead of assuming a baseline on your behalf — the same reason it never *predicts* ("this turn runs on Pro") and only states facts it observed.
+- **There is no per-turn figure either.** Both surfaces are session-cumulative; a per-turn split means replaying your own session log.
+
+Scope: the cost ledger lives in session memory — a new session or `/clear` restarts it from zero. The hook layer's counters are a different store and do persist (see *Install*).
 
 ## modelDirector: the tier director
 
@@ -112,6 +146,9 @@ Events:
 - The read records are also keyed by resolved path; a file reached through a junction or hard link that resolves elsewhere is treated as different file from an earlier spelling.
 - Status-bar figures are aggregated from `turn.complete`, and `/compact` does not reset the running totals.
 - **Costs are priced per turn by the tier that turn actually ran at** — the escalation fact above (engine-reported resolved model, OR `usage.model` where faithful): Pro-served tokens at Pro rates, the rest at the cheap ones, with the Pro portion broken out. Attribution is **turn-level**, so a lifted turn is counted entirely as Pro even though its first requests ran cheap — a deliberate slight over-estimate. Ledgers written before v0.2.5 carry no per-tier split (cheap rates); v0.2.5 and earlier decided the tier from `usage.model`, which on a direct DeepSeek endpoint reads as *always cheap* — don't compare cost figures across either line.
+- **A "turn" is whatever the engine says it is.** An async subagent splits one of your messages into **two** engine turns — the delegation closing one, the hand-back opening the next — so the round count can exceed the number of messages you sent. Not a bug: verified against the engine's own `turn_duration` records (which is also where a turn's wall-clock length comes from).
+- If the upgrade skill ran in the **first half** of a turn that a subagent hand-back later split, that continuation half can match the same escalation timestamp and be priced as Pro too — the same over-estimate direction as the turn-level caveat above (it never under-reports).
+- The plugin's **own status strings are Chinese-only** today (`轮次`, `档位构成`, the trim notices), even though this README is bilingual. Prices, model names and the currency prefix are config-driven; the labels themselves are not localized yet.
 - `config.json`'s `_comment` documents every key's exact semantics, including the caveats above — it ships with the plugin.
 
 ## Verify
@@ -124,6 +161,9 @@ claude plugin validate plugin --strict
 ## Links
 
 - [Claude Market](https://www.claudemarket.ai/plugins) — plugin directory
+- [Claude Plugin Hub](https://www.claudepluginhub.com/plugins/zoria-lind-cc-token-optimizer-plugin) — plugin directory (verified listing)
+
+Issues and pull requests are welcome.
 
 MIT © Zoria Lind.
 

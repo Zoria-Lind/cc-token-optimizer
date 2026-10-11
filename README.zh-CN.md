@@ -2,6 +2,8 @@
 
 [English](README.md) · **中文**
 
+[![Listed on ClaudePluginHub](https://www.claudepluginhub.com/badge/zoria-lind-cc-token-optimizer-plugin)](https://www.claudepluginhub.com/plugins/zoria-lind-cc-token-optimizer-plugin)
+
 给 Claude Code 的 token 优化器 —— 降低一次会话的真实花费:读去重、输出裁剪、缓存过期提醒,外加提示符上方的成本 / 命中率悬浮条。**一条命令装完即用**:不改 `settings.json`,不需要 `node`。
 
 ## 安装
@@ -10,9 +12,9 @@
 /plugin install cc-token-optimizer --marketplace Zoria-Lind/cc-token-optimizer
 ```
 
-Claude Code 2.1.275+。会先问是否添加该 marketplace(`y`),再选作用域(推荐 `user`,对所有会话生效)。装完即用:
+Claude Code 2.1.275+(开发与实测于 **2.1.296**)。会先问是否添加该 marketplace(`y`),再选作用域(推荐 `user`,对所有会话生效)。装完即用:
 
-- 模块(readDedup / recordRead / outputTrim / coldStartGuard / modelDirector / tierFact / compactReset 等)注册在插件内部的 `hooks/tokenGuard.ts`,随插件一起加载
+- 模块(readDedup / recordRead / outputTrim / coldStartGuard / modelDirector / tierFact / compactReset 等)注册在插件内部的 `hooks/tokenGuard.ts`,悬浮条与 `/token-status` 注册在 `hooks/register.tsx`,随插件一起加载
 - 状态有**两处**,寿命不同:
   - hooks 层的 `guard-state`(读记录 / 裁剪计数 / 档位事实)落在宿主的插件 KV —— `<配置目录>/plugins/store/cc-token-optimizer*.json` —— 跨会话与热重载都在。**不是 `$.state`**(v0.2.0 踩过这个坑,0.2.1 修)
   - 悬浮条与 `/token-status` 背后的**成本账本**(轮次 / token / 档位分账)存在 `$.state`,**这是会话级设计**:热重载能续,但新会话或 `/clear` 从零开始。「¥0.40」是**本会话**的数,不是累计数
@@ -25,6 +27,36 @@ Claude Code 2.1.275+。会先问是否添加该 marketplace(`y`),再选作用域
 /plugin update cc-token-optimizer@zoria-plugins
 ```
 
+关掉/卸载:在 `/plugin` 管理器里 disable 或 uninstall,或在 shell 里 `claude plugin disable cc-token-optimizer`。它只写两处自己的东西:`<配置目录>/plugins/store/` 下的存储,以及插件自己目录里的裁剪存档(`plugin/.archive/<会话>/`);机器上别的文件一概不动。
+
+## 这条数是什么意思
+
+提示符上方每条都会显示 —— 下面是**真实的一张,未做任何修改**:
+
+![提示符上方的悬浮条](docs/bar.png)
+
+同一行,文字版:
+
+```
+[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · ¥1.93·混合(Pro ¥1.39)
+```
+
+`/token-status` 打印同一份账,并给出拆分(这里数字为示意):
+
+```
+- 轮次: 8(另有 usage 缺失 0 轮、子代理 2 轮,未计价)
+- 成本(¥,按各轮真实档位分账 · 空闲价): ¥0.120 = 输入未命中 ¥0.030 + 缓存读 ¥0.040 + 输出 ¥0.050
+- 档位构成: Pro ¥0.080(1 轮)/ 基础档 ¥0.040(7 轮)
+```
+
+有三件事必须说死,因为那条东西很容易被读错:
+
+- **那个 `¥` 是「本会话到目前为止实际花掉的钱」** —— 累计值、峰谷价、每轮按它真实跑的档位计价。**不是「省下了多少钱」**
+- **插件刻意不显示「省了多少」**:「省」只有相对一个反事实基准才有意义(例如"同样的 token 量全按 Pro 计价"),而插件只报引擎报出的事实,不替你假设基准 —— 这也是它从**不预测**("本回合按 Pro 档执行")、只陈述已观察到的事实的同一个理由
+- **也没有任何「单轮金额」出口**:两处显示都是本会话累计;想看单轮只能自己回放会话日志
+
+寿命:成本账本是**会话级**内存,新会话或 `/clear` 从零开始;hooks 层的计数是**另一份**存储,跨会话保留(见上一节)。
+
 ## 模块一览
 
 | 模块 | 挂点 | 作用 |
@@ -36,7 +68,7 @@ Claude Code 2.1.275+。会先问是否添加该 marketplace(`y`),再选作用域
 | **modelDirector** | SessionStart · UserPromptSubmit · `tool.call` Edit/Write/NotebookEdit · PreModelSwitch · PostModelSwitch | 档位"导演":机械检测升档建议 + **可选的硬升档闸** + 切换成本透明(详见下节) |
 | **tierFact** | PostToolUse Skill | 从 Skill 工具自己的结果里读引擎解析出的模型(直连 DeepSeek 时唯一可信的升档信号);是 Pro 档就把事实记进 `_proAt`/`_proEpoch`,并**当场**弹提醒。成本分账与硬升档闸都读这个事实 |
 | **compactReset** | `session.compact` | 压缩点把本会话的读记录作废:harness 压缩时会把旧工具输出清出上下文,此后"你已经读过这个文件"的记录全是过时的。`trigger: "precompute"` 跳过 —— 它是唯一不落地的那种派发 |
-| **悬浮条** · `/token-status` | AbovePrompt · 斜杠命令 | 轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 缓存命中率 / **成本(按各轮真实档位分账 · 峰谷价;混合档会标出 Pro 那部分)**;命令看三段成本拆分 + 档位构成 |
+| **悬浮条** · `/token-status` | AbovePrompt · 斜杠命令 | 轮次 / 上下文大小 / 输入+缓存读写 / 输出 / 缓存命中率 / **成本(按各轮真实档位分账 · 峰谷价;混合档会标出 Pro 那部分)**;命令看三段成本拆分 + 档位构成。⚠ **两处都是本会话累计,`¥` 是实花、不是省下的钱**(见「这条数是什么意思」) |
 | **`tools/stats.mjs`** | 手动 | 跨会话汇总拦截/裁剪/折叠计数与存档体积,估算累计省下的 token |
 
 ## modelDirector:档位导演
@@ -115,6 +147,9 @@ Claude Code 2.1.275+。会先问是否添加该 marketplace(`y`),再选作用域
 - 读记录的键是**解析后路径** ⇒ 同一个文件若经 junction / 硬链接抵达、解析到了别处,就会与先前那种拼写被当成**两个**文件(那一次去重机会就丢了)
 - 悬浮条数值来自 turn.complete 聚合,压缩(`/compact`)后累计口径不重置
 - **成本按每轮「真实档位」分账计价** —— 判据同上(引擎报的解析模型,`usage.model` 作兜底):Pro 档作答的部分走 Pro 价目、其余走基础价,混合档单独标出 Pro 那部分。归属是**回合级**:升档回合里"技能调用之前"的请求也会计入 Pro ⇒ 略偏高(有意保守)。**v0.2.5 之前的账本没有分账字段**(历史按基础档计价);**v0.2.5 及更早**用 `usage.model` 判档 ⇒ 在直连 DeepSeek 上恒记为基础档 —— 跨这两条线比较成本都无意义
+- **「一个回合」由引擎说了算**:异步子 agent 会把你**一条消息拆成两个回合**(派出去时收一个、hand-back 续接时又开一个)⇒ 显示的**轮次可能多于你发的消息条数**。不是 bug —— 已用引擎自己的 `turn_duration` 记录核过(回合的墙钟长度也来自它)
+- 若强档技能运行在「后来被 hand-back 拆开」那个回合的**前半段**,续接的后半段会命中同一个升档时间戳、也被算作 Pro —— 与上一条同方向的**偏高**(绝不偏低)
+- 插件**自带的界面文案目前只有中文**(`轮次` / `档位构成` / 裁剪提示等都是),尽管本 README 是中英双份。价目、模型名、货币前缀都走配置,但**标签本身还没做本地化**
 - `config.json` 的 `_comment` 里写了每个键的口径,发行文件里也如实标注了上述边界
 
 ## 验证
@@ -123,6 +158,13 @@ Claude Code 2.1.275+。会先问是否添加该 marketplace(`y`),再选作用域
 claude plugin test plugin      # 58 项:hook 行为(拦截/逃生/裁剪/折叠/硬闸/状态隔离/分账计价/压缩)
 claude plugin validate plugin --strict
 ```
+
+## 链接
+
+- [Claude Market](https://www.claudemarket.ai/plugins) —— 插件目录
+- [Claude Plugin Hub](https://www.claudepluginhub.com/plugins/zoria-lind-cc-token-optimizer-plugin) —— 插件目录(已验证收录)
+
+欢迎提 issue / PR。
 
 ## 许可
 
