@@ -53,13 +53,17 @@ Nothing else on your machine is touched: the only things it writes are its own s
 
 ## What the numbers mean
 
-Above every prompt (figures illustrative):
+Above every prompt — a real one, unedited:
+
+![the status bar above the prompt](docs/bar.png)
+
+The same line as text:
 
 ```
-[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · 混合(Pro 1.4M) · 上轮 +27k
+[opt] 13轮 · ctx 134k (13%) · 输入 68k + 缓存读 4.2M / 写 0 · 输出 72k · 命中 98.4% · 混合(Pro 1.5M) · 上轮 +268k
 ```
 
-`/token-status` prints the same ledger, with the breakdown:
+`/token-status` prints the same ledger, with the breakdown (figures illustrative here):
 
 ```
 - 轮次: 15(另有 usage 缺失 0 轮、子代理 2 轮,未计入)
@@ -76,9 +80,10 @@ With `/tier-auto off` the bar gains one more mark — `· 升档关` — and tha
 The built-in labels are Chinese today (see *Honest edges*). **Tokens only — and that is a deliberate design decision, not a missing feature:**
 
 - **There is no cost figure anywhere, and there will not be one.** Money depends on your provider's billing rules, and those do **not** follow the model name the engine reports. Measured on a gateway that routes per call: in one stretch **9 of 15 calls were billed as Pro while the plugin's own session had escalated exactly zero times**, and the session log recorded *flash* for every one of them — the model that actually served a request is not visible to a plugin at all. A figure derived from those labels was off by **2.5–4×** against a real bill. Tokens, by contrast, are something every provider counts the same way.
-- **The per-turn number is the one that changes behaviour.** `上轮 +27k` is what the last turn put into the context — and that content is re-read on **every** request after it. Redirecting a long log to a file or running `/compact` sooner is the lever that shows up in a bill; the bar's ⚠ at ≥50% context is the same nudge.
-- **The tier split is counted in tokens, and it is a lower bound.** `混合(Pro 1.4M)` / `档位构成(token)` say how many tokens ran on the strong tier, judged **only from what a plugin can see**: a skill-driven escalation during that turn, or a session whose base tier is already strong. **A gateway that routes calls on its own is invisible here** — measured: the platform billed 6 of 15 calls as Pro in a stretch where this plugin had escalated zero times. Read the Pro share as a floor, not a total.
+- **The per-turn number is the one that changes behaviour.** `上轮 +268k` is what the last turn put into the context — and that content is re-read on **every** request after it. Redirecting a long log to a file or running `/compact` sooner is the lever that shows up in a bill; the bar's ⚠ at ≥50% context is the same nudge.
+- **The tier split is counted in tokens, and it is a lower bound.** `混合(Pro 1.5M)` / `档位构成(token)` say how many tokens ran on the strong tier, judged **only from what a plugin can see**: a skill-driven escalation during that turn, or a session whose base tier is already strong. **A gateway that routes calls on its own is invisible here** — measured: the platform billed 6 of 15 calls as Pro in a stretch where this plugin had escalated zero times. Read the Pro share as a floor, not a total.
 - **Both surfaces are session-cumulative**: a new session or `/clear` restarts them from zero. The hook layer's counters are a different store and do persist (see *Install*).
+- **`缓存写 0` (cache write: 0) is not a bug.** That cell is *cache creation* (`cache_creation_input_tokens`) — how much content was written into the prompt cache — **not output**: output is the cell to its right (`输出 …`), it is always priced, and it is the most expensive line in the table. DeepSeek's price list has exactly three lines — input (cache hit) / input (cache miss) / output — and **no fourth "cache write" line** (writing is not charged separately), so their endpoint does not report that quantity at all. Measured: in one session **all 84 responses** reported `cache_creation_input_tokens: 0` (with the `cache_creation.ephemeral_*` breakdown also all zero) while cache **reads** totalled **9.9M** — had nothing been written, nothing could be read back. Anthropic's own endpoint does charge a cache-write premium and does populate the field.
 
 ## modelDirector: the tier director
 
@@ -155,7 +160,7 @@ claude plugin validate plugin --strict
 
 ## Links
 
-- [Claude Market](https://www.claudemarket.ai/plugins) — plugin directory
+- [Claude Market](https://www.claudemarket.ai/plugins) — plugin directory ([cc-token-optimizer entry](https://www.claudemarket.ai/plugins/zoria-lind-cc-token-optimizer/cc-token-optimizer))
 - [Claude Plugin Hub](https://www.claudepluginhub.com/plugins/zoria-lind-cc-token-optimizer-plugin) — plugin directory (verified listing)
 
 Issues and pull requests are welcome.
