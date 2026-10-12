@@ -20,6 +20,15 @@ export type UsageTotals = {
   output: number
   cacheRead: number
   cacheCreation: number
+  /** 按**档位**分账的 token(2026-10-12 回归):本会话里由强档作答的那部分 token。
+   *  ⚠ 与 0.2.x 的区别:**只数 token,不乘价目**(金额已整条移除)。基础档部分 = 总量 − pro 部分。
+   *  ⚠ 口径是**下限**:判据只有"插件驱动的升档"与"会话基础档本身是强档",网关自己路由的强档调用看不到。 */
+  proInput: number
+  proOutput: number
+  proCacheRead: number
+  proCacheCreation: number
+  /** 由强档作答的主会话轮次。 */
+  proTurns: number
   /** 上一轮(最近一个已结束的回合)新增的 token 合计 = input + read + creation + output。
    *  条上那格「上轮 +Δ」就是它;旧账本没有该字段 ⇒ 视为 0(那一格不显示)。 */
   lastTurnTokens: number

@@ -56,7 +56,7 @@ Nothing else on your machine is touched: the only things it writes are its own s
 Above every prompt (figures illustrative):
 
 ```
-[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · 上轮 +27k
+[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · 混合(Pro 1.4M) · 上轮 +27k
 ```
 
 `/token-status` prints the same ledger, with the breakdown:
@@ -65,14 +65,19 @@ Above every prompt (figures illustrative):
 - 轮次: 15(另有 usage 缺失 0 轮、子代理 2 轮,未计入)
 - 输入 96k / 缓存读 9.9M / 缓存写 0 / 输出 143k(上轮 +27k)
 - 缓存命中率: 99.0%
+- 档位构成(token): Pro 1.4M(1 轮)/ 基础档 9.0M(14 轮)
+- 自动升档: 开(改代码文件的首次调用会先拦一次)
 - 输出占比 2%(输出含思考 token)
 - 统计窗口: 会话始于 10-11 02:35 · 首轮于 02:37 · 本实例 register 加载 1 次(未重载)
 ```
+
+With `/tier-auto off` the bar gains one more mark — `· 升档关` — and that `自动升档` line flips to `**关**`.
 
 The built-in labels are Chinese today (see *Honest edges*). **Tokens only — and that is a deliberate design decision, not a missing feature:**
 
 - **There is no cost figure anywhere, and there will not be one.** Money depends on your provider's billing rules, and those do **not** follow the model name the engine reports. Measured on a gateway that routes per call: in one stretch **9 of 15 calls were billed as Pro while the plugin's own session had escalated exactly zero times**, and the session log recorded *flash* for every one of them — the model that actually served a request is not visible to a plugin at all. A figure derived from those labels was off by **2.5–4×** against a real bill. Tokens, by contrast, are something every provider counts the same way.
 - **The per-turn number is the one that changes behaviour.** `上轮 +27k` is what the last turn put into the context — and that content is re-read on **every** request after it. Redirecting a long log to a file or running `/compact` sooner is the lever that shows up in a bill; the bar's ⚠ at ≥50% context is the same nudge.
+- **The tier split is counted in tokens, and it is a lower bound.** `混合(Pro 1.4M)` / `档位构成(token)` say how many tokens ran on the strong tier, judged **only from what a plugin can see**: a skill-driven escalation during that turn, or a session whose base tier is already strong. **A gateway that routes calls on its own is invisible here** — measured: the platform billed 6 of 15 calls as Pro in a stretch where this plugin had escalated zero times. Read the Pro share as a floor, not a total.
 - **Both surfaces are session-cumulative**: a new session or `/clear` restarts them from zero. The hook layer's counters are a different store and do persist (see *Install*).
 
 ## modelDirector: the tier director
@@ -144,7 +149,7 @@ Events:
 ## Verify
 
 ```sh
-claude plugin test plugin      # 57 checks: denial / escape hatch / trimming / folding / hard gate / tier switch / state isolation / ledger / compaction
+claude plugin test plugin      # 60 checks: denial / escape hatch / trimming / folding / hard gate / tier switch + token tier split / state isolation / ledger / compaction
 claude plugin validate plugin --strict
 ```
 

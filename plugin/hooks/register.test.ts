@@ -184,6 +184,32 @@ test('/tier-auto 关掉后:账本照常计(开关只管"推",不影响 token 计
   expect(out.text).toMatch(/上轮 \+110/)
 })
 
+// —— 档位分账(2026-10-12 回归:**按 token 计,绝不乘价目**)——
+test('档位分账(token):引擎报强档的那一轮 → 记进 Pro 桶', async ($, on) => {
+  setup(on)
+  await start($)
+  await turn($, { model: 'deepseek-v4-pro[1m]', input_tokens: 1500, output_tokens: 500, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, undefined)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/档位构成\(token\): Pro 2k\(1 轮\)/)
+  expect(out.text).toMatch(/下限/) // 口径必须写明"这是下限"(网关自己路由的强档调用看不到)
+})
+
+test('档位分账(token):插件驱动的升档(guard-state 的 _proAt)也算强档', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  b.guardStore.set('guard-state', { 'sess-A': { _proAt: Date.now(), _at: Date.now() } })
+  await turn($, { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, undefined, 30000)
+  expect((await runCmd($, 'token-status')).text).toMatch(/档位构成\(token\): Pro 110\(1 轮\)/)
+})
+
+test('/token-status 也显示自动升档开关状态(发现性)', async ($, on) => {
+  setup(on)
+  await start($)
+  expect((await runCmd($, 'token-status')).text).toMatch(/自动升档: 开/)
+  await runCmdArgs($, 'tier-auto', 'off')
+  expect((await runCmd($, 'token-status')).text).toMatch(/自动升档: \*\*关\*\*/)
+})
+
 // 悬浮条(AbovePrompt)不做单元断言:测试框架要求 ui.render 的 bottom 返回真实树元素,
 // 而元素构造器只存在于引擎内部,测试 bottom 拿不到。其验证由三层兜底:
 // engine validate(API 形状)+ 热重载零失败(引擎加载)+ /token-status(数据路径)+ 用户肉眼(输入框上方)。
