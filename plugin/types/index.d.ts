@@ -20,14 +20,9 @@ export type UsageTotals = {
   output: number
   cacheRead: number
   cacheCreation: number
-  /** 按**真实档位**分账(2026-10-10):本会话里由 Pro 档模型作答的那部分 token。
-   *  基础档部分 = 总量 − pro 部分;旧账本没有这些字段 ⇒ 视为 0(整段按基础档计价,与旧口径一致)。 */
-  proInput: number
-  proOutput: number
-  proCacheRead: number
-  proCacheCreation: number
-  /** 由 Pro 档作答的主会话轮次。 */
-  proTurns: number
+  /** 上一轮(最近一个已结束的回合)新增的 token 合计 = input + read + creation + output。
+   *  条上那格「上轮 +Δ」就是它;旧账本没有该字段 ⇒ 视为 0(那一格不显示)。 */
+  lastTurnTokens: number
   /** 本会话首轮计数时刻(ms)。 */
   firstAt: number | null
   /** 最近一轮计数时刻(ms)。 */

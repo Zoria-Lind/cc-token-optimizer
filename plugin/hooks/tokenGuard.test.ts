@@ -200,12 +200,11 @@ test('modelDirector:config 配了 skillName → 升档建议点名该技能', as
   expect(JSON.stringify(r)).toMatch(/my-upgrade-skill/)
 })
 
-test('money:config 里的 currency 前缀会用在切换成本估算上', async ($, on) => {
+test('PreModelSwitch:只讲 token 事实,不再估算金额(0.3.0 移除金额)', async ($, on) => {
   const b = setupGuard(on)
-  b.files.set('/plugin/config.json', { text: JSON.stringify({ currency: '$' }), mtimeMs: 1, size: 16 })
   await $.classic.PreModelSwitch({ from_model: 'cheap-x', to_model: 'pro-y', context_tokens: 80000 })
-  // 80k × 4.5 元/M = 0.36,前缀换成 $ 后同额
-  expect(b.toasts.join(' ')).toMatch(/重缓存约 \$0\.36/)
+  expect(b.toasts.join(' ')).toMatch(/上下文约 80k token/)
+  expect(b.toasts.join(' ')).not.toMatch(/¥|\$|重缓存约/) // 任何金额/估价措辞都不许再出现
 })
 
 // —— 硬升档闸:模型决定改代码 = 事实上的 coding 判定,插件据此把它当轮推到强档 ——

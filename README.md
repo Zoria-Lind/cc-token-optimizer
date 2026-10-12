@@ -4,7 +4,7 @@
 
 [![Listed on ClaudePluginHub](https://www.claudepluginhub.com/badge/zoria-lind-cc-token-optimizer-plugin)](https://www.claudepluginhub.com/plugins/zoria-lind-cc-token-optimizer-plugin)
 
-A Claude Code plugin that cuts what a session actually costs — read de-duplication, output trimming, cache-stall nudges, and a live cost / cache-hit bar above the prompt.
+A Claude Code plugin that cuts what a session actually burns — read de-duplication, output trimming, cache-stall nudges, and a live **token** / cache-hit bar above the prompt. It reports **tokens only**: no cost estimate, deliberately (see *What the numbers mean*).
 
 ```
 /plugin install cc-token-optimizer --marketplace Zoria-Lind/cc-token-optimizer
@@ -19,7 +19,7 @@ It asks whether to add the marketplace (`y`), then for a scope — `user` applie
 - The eight hook registrations live in the plugin itself (`plugin/hooks/tokenGuard.ts`; the status bar and `/token-status` are registered in `plugin/hooks/register.tsx`), and load with it.
 - There are **two** stores, with different lifetimes:
   - The hook layer's `guard-state` (read records, trim counters, tier facts) lives in the host's plugin KV — `<config dir>/plugins/store/cc-token-optimizer*.json` — so it survives across sessions and hot reloads. It is **not** `$.state` (v0.2.0 shipped that mistake; fixed in 0.2.1).
-  - The **cost ledger** behind the status bar and `/token-status` (rounds, tokens, the per-tier cost split) lives in `$.state`, which is session-scoped by design: it survives a hot reload, but a new session or `/clear` starts from zero. "¥0.40" means *this session*, not a lifetime total.
+  - The **token ledger** behind the status bar and `/token-status` (rounds, tokens, the last turn's growth) lives in `$.state`, which is session-scoped by design: it survives a hot reload, but a new session or `/clear` starts from zero. Its figures mean *this session*, not a lifetime total.
 - Config is read from the plugin's own `config.json`; a missing or corrupt file falls back to built-in defaults instead of erroring.
 
 Update:
@@ -44,40 +44,36 @@ Nothing else on your machine is touched: the only things it writes are its own s
 | **readDedup** | `tool.call` Read | Denies a re-read when the file is unchanged (mtime + size) and the requested range is **already fully** in context. Partial overlap **passes** and is merged into the record. Three denials in a row on the same file → always passes (escape hatch). Two things it deliberately does **not** dedup: PDF page-range reads (`pages` says nothing about line ranges) and anything after a compaction (see compactReset). |
 | **recordRead** | after that same Read | Stores mtime/size + read ranges (v2 format, bucketed per session / sub-agent, LRU-pruned), keyed by the file's **resolved** path (so `D:\a\b.ts` and `D:/a/b.ts` are one record) and holding the range the tool **actually returned** — a token-capped read is recorded as the page the model really saw, not as what was asked for. |
 | **outputTrim** | `PostToolUse` Bash/PowerShell | Folds runs of ≥3 identical lines; if the output is still over 5000 chars, head/tail samples are injected (1500+1500; 800+800 when the command failed). **Whenever anything is folded or trimmed, the full original is archived to disk first** and the archive path is appended to what the model sees. (Archive writes go through the host's `fs.write`, which refuses anything over 4 MiB — a larger output gets trimmed with no archive path.) |
-| **coldStartGuard** | `SessionStart` | A resumed session whose prompt cache has expired gets one line: context size, estimated re-cache cost, and "consider `/clear`". |
-| **modelDirector** | `SessionStart` · `UserPromptSubmit` · `tool.call` Edit/Write/NotebookEdit · `PreModelSwitch` · `PostModelSwitch` | Tier discipline: mechanical upgrade nudges + an **optional hard gate** + transparent switch cost (see below). |
-| **tierFact** | `PostToolUse` Skill | Reads the resolved model out of the Skill tool's own result — the only trustworthy escalation signal against a direct DeepSeek endpoint — and when it is a Pro model records the fact (`_proAt` / `_proEpoch`) and toasts you **at the moment it happens**. Both the cost split and the hard gate read that fact. |
+| **coldStartGuard** | `SessionStart` | A resumed session whose prompt cache has expired gets one line: context size, how many tokens the next request will have to re-read, and "consider `/clear`". |
+| **modelDirector** | `SessionStart` · `UserPromptSubmit` · `tool.call` Edit/Write/NotebookEdit · `PreModelSwitch` · `PostModelSwitch` | Tier discipline: mechanical upgrade nudges + an **optional hard gate** + a transparent switch warning, in tokens (see below). |
+| **tierFact** | `PostToolUse` Skill | Reads the resolved model out of the Skill tool's own result — the only trustworthy escalation signal against a direct DeepSeek endpoint — and when it is a Pro model records the fact (`_proAt` / `_proEpoch`) and toasts you **at the moment it happens**. The hard gate reads that fact (0.3.0: nothing else does — cost accounting is gone). |
 | **compactReset** | `session.compact` | Drops the session's read records at a compaction: the harness clears old tool output out of context when it compacts, so every "you already read this" record is stale from that point on. `trigger: "precompute"` is skipped — it is the one dispatch that installs nothing. |
-| **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **cost (peak/off-peak, priced per turn by the model that actually answered — a mixed tier is marked with the Pro portion)**; the command adds a three-way cost breakdown and a per-tier split. ⚠ **Session-cumulative, and the `¥` is spend — not savings** (see *What the numbers mean*). |
+| **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **and how much the last turn added (`上轮 +Δ`)**; the command adds the output share and the session window. ⚠ **Session-cumulative, and tokens only — there is no money figure anywhere** (see *What the numbers mean*). |
 | **`tools/stats.mjs`** | manual | Sums denials, trims, folded lines and archive size across sessions, and estimates tokens saved. |
 
 ## What the numbers mean
 
-Above every prompt — a real one, unedited:
-
-![the status bar above the prompt](docs/bar.png)
-
-The same line as text:
+Above every prompt (figures illustrative):
 
 ```
-[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · ¥1.93·混合(Pro ¥1.39)
+[opt] 15轮 · ctx 227k (23%) · 输入 96k + 缓存读 9.9M / 写 0 · 输出 143k · 命中 99.0% · 上轮 +27k
 ```
 
-`/token-status` prints the same ledger, with the breakdown (figures illustrative here):
+`/token-status` prints the same ledger, with the breakdown:
 
 ```
-- 轮次: 8(另有 usage 缺失 0 轮、子代理 2 轮,未计价)
-- 成本(¥,按各轮真实档位分账 · 空闲价): ¥0.120 = 输入未命中 ¥0.030 + 缓存读 ¥0.040 + 输出 ¥0.050
-- 档位构成: Pro ¥0.080(1 轮)/ 基础档 ¥0.040(7 轮)
+- 轮次: 15(另有 usage 缺失 0 轮、子代理 2 轮,未计入)
+- 输入 96k / 缓存读 9.9M / 缓存写 0 / 输出 143k(上轮 +27k)
+- 缓存命中率: 99.0%
+- 输出占比 2%(输出含思考 token)
+- 统计窗口: 会话始于 10-11 02:35 · 首轮于 02:37 · 本实例 register 加载 1 次(未重载)
 ```
 
-The built-in labels are Chinese today (see *Honest edges*). Three things are worth stating outright, because the bar invites the wrong reading:
+The built-in labels are Chinese today (see *Honest edges*). **Tokens only — and that is a deliberate design decision, not a missing feature:**
 
-- **That `¥` is what this session has actually spent so far** — cumulative, off-peak/peak, each turn priced at the tier it really ran on. It is **not** "you saved X".
-- **There is deliberately no savings figure anywhere.** "Saved" only means something against a counterfactual (e.g. *the same tokens, all on the pro tier*), and this plugin reports what the engine reports instead of assuming a baseline on your behalf — the same reason it never *predicts* ("this turn runs on Pro") and only states facts it observed.
-- **There is no per-turn figure either.** Both surfaces are session-cumulative; a per-turn split means replaying your own session log.
-
-Scope: the cost ledger lives in session memory — a new session or `/clear` restarts it from zero. The hook layer's counters are a different store and do persist (see *Install*).
+- **There is no cost figure anywhere, and there will not be one.** Money depends on your provider's billing rules, and those do **not** follow the model name the engine reports. Measured on a gateway that routes per call: in one stretch **9 of 15 calls were billed as Pro while the plugin's own session had escalated exactly zero times**, and the session log recorded *flash* for every one of them — the model that actually served a request is not visible to a plugin at all. A figure derived from those labels was off by **2.5–4×** against a real bill. Tokens, by contrast, are something every provider counts the same way.
+- **The per-turn number is the one that changes behaviour.** `上轮 +27k` is what the last turn put into the context — and that content is re-read on **every** request after it. Redirecting a long log to a file or running `/compact` sooner is the lever that shows up in a bill; the bar's ⚠ at ≥50% context is the same nudge.
+- **Both surfaces are session-cumulative**: a new session or `/clear` restarts them from zero. The hook layer's counters are a different store and do persist (see *Install*).
 
 ## modelDirector: the tier director
 
@@ -99,34 +95,27 @@ Events:
   - **Subagent edits are never denied.** A delegated edit arrives with an `agentId`; the gate fires only on the main loop's own edits. A subagent already runs on the (usually cheaper) subagent model, while a skill's `model:` header switches the **session turn** — it cannot re-tier a subagent that is already running, so the denial's advice ("call the upgrade skill") is unactionable. Worse, that needless denial would consume the turn's single forced slot, leaving the main loop's own first edit ungated. Subagent edits still stamp the sticky window (`_codingAt`).
   - **No skill name configured → no gate at all.** Denying with no skill to call would only deadlock the model.
 - **The upgrade skill** lives at `<config dir>/skills/<your-skill>/SKILL.md`, and its frontmatter `model:` header names the strong model — active for that turn only, falls back next turn, nothing written to disk. **A skill's `model:` header is the only non-user-triggered model switch in Claude Code** (hooks cannot switch the model — confirmed in the docs, measured working on 2026-10-07), which is why the gate can only *ask the model to call a skill*; the plugin itself cannot change tiers.
-- **`PreModelSwitch`** — shows the cost of the switch ("dropping the prompt cache, ~80k context, ~¥0.36 to re-cache") so you switch at a task boundary.
+- **`PreModelSwitch`** — warns what the switch does to the cache ("dropping the prompt cache: ~80k tokens, and the next request re-reads them at the miss price") so you switch at a task boundary.
 - **`PostModelSwitch`** — records the new tier and injects the matching reminder.
 
 ## Configuration
 
-`plugin/config.json` is the single source of truth (edit it, never the code): dual pricing tiers (cheap/pro, per million tokens), holidays, model-name mapping, currency prefix, and the upgrade heuristic (keywords, sticky window, cooldown). DeepSeek terms: peak = Mon–Fri 09:00–12:00 and 14:00–18:00 Beijing time on non-holidays; **weekends (including make-up weekends) and holidays are off-peak all day**.
+`plugin/config.json` is the single source of truth (edit it, never the code): the model-name mapping (`models.cheap` / `models.pro`) and the upgrade heuristic (keywords, sticky window, cooldown). **There is no pricing table** — 0.3.0 removed it together with every money display (see *What the numbers mean*).
 
 **The skill name is a plugin option, not a `config.json` value** (priority: plugin option > `config.json`'s `upgrade.skillName`). Set `upgrade_skill` in `/config`; the value is written to **your own** `settings.json` and survives plugin upgrades. The shipped `config.json` leaves it **blank** ⇒ a stranger installing this is never gated and never has the plugin call a skill they do not have.
 
-**Using a provider other than DeepSeek** — the shipped defaults are DeepSeek's; edit `config.json`:
+**Using a provider other than DeepSeek** — point the two model names at whatever you actually run:
 
 ```json
 {
-  "pricing": {
-    "cheap": { "idle": { "hit": 0, "miss": 0, "out": 0 }, "peak": { "hit": 0, "miss": 0, "out": 0 } },
-    "pro":   { "idle": { "hit": 0, "miss": 0, "out": 0 }, "peak": { "hit": 0, "miss": 0, "out": 0 } }
-  },
+  "defaultTier": "cheap",
   "models": { "cheap": "your-cheap-model", "pro": "your-strong-model" },
-  "currency": "$",
   "upgrade": { "keywords": ["your", "terms"], "cooldownMin": 10, "stickyMin": 30, "skillName": "" }
 }
 ```
 
-- **No peak/off-peak pricing** (most providers): set `peak` equal to `idle`.
-- **No cache discount, or a different cache model** (Anthropic itself charges less for cache reads and more for cache writes): set `hit` to 0 or to your real discount; the cost line degrades to a miss+output estimate, still the right order of magnitude.
-- **Tier detection** matches `models.pro` exactly (works for any provider); the `includes('pro')` check is only a fallback heuristic for DeepSeek-style names.
-- **Currency**: `currency` is the prefix used by the status bar, `/token-status` and the switch-cost estimate — use `"$"` for dollars.
-- **Token accounting** is auto-compatible with both conventions: DeepSeek's Anthropic-compatible endpoint reports `input_tokens` **without** cache reads (measured: cacheRead 1.1M with input 3k), Anthropic's includes them. Miss-priced part = `cacheRead > input ? input + cacheCreation : input - cacheRead`; hit part = cacheRead.
+- **Model names are the only provider-specific input.** Tier detection matches `models.pro` exactly (works for any provider); the `includes('pro')` check is only a fallback heuristic for DeepSeek-style names. Nothing else in the plugin cares who serves you — that is the point of dropping the price table.
+- **Token accounting** is auto-compatible with both conventions: DeepSeek's Anthropic-compatible endpoint reports `input_tokens` **without** cache reads (measured: cacheRead 1.1M with input 3k), Anthropic's includes them. The cache-hit rate normalizes for both.
 
 ## Cache safety
 
@@ -137,7 +126,7 @@ Events:
 
 ## Honest edges
 
-- **Pricing, model names and the currency symbol default to DeepSeek** (dual peak/off-peak tiers, `currency: "¥"`). Another provider means editing `config.json` — no code changes. Peak/off-peak is evaluated in **Beijing time (UTC+8)** whatever your machine's timezone is, and `holidays` is a China State Council list — outside China, set `peak` equal to `idle` (or keep your own date list).
+- **The plugin reports tokens, not money — deliberately.** Billing rules belong to your provider, and they do not have to follow the model name the engine reports: on one gateway, **9 of 15 calls in a stretch were billed as Pro while nothing in that session had escalated**, and the log said `flash` for every one of them. Cost figures derived from those labels were off by **2.5–4×** against a real bill, so 0.3.0 removed them outright. Your bill is the only source of truth for money; this plugin's job is to keep the token counts honest.
 - **The hard gate's price**: its judgement reads the session's *base* tier, but it also accepts this turn's escalation fact, so **a turn that already escalated is not denied again**; at most once per turn; and it is completely off unless you configure a skill name.
 - **The upgrade nudge names a skill**, and a skill's `model:` header is the only way a plugin can switch tiers without you typing `/model`. With no skill name anywhere, the advice degrades to a plain "switch with `/model`".
 - **readDedup** compares mtime + size rather than content hashes (a same-second, same-size rewrite is missed), and recent Claude Code builds already answer whole-file re-reads natively — the remaining value is partial-overlap merging and long-span re-reads.
@@ -145,16 +134,15 @@ Events:
 - The archive folder **cannot delete anything** — the host's `fs` has no remove API — so eviction writes an empty file over the oldest slot. Archived *content* stays bounded (20 files' worth), but the file *count* grows by one per trim, as zero-byte husks.
 - The read records are also keyed by resolved path; a file reached through a junction or hard link that resolves elsewhere is treated as different file from an earlier spelling.
 - Status-bar figures are aggregated from `turn.complete`, and `/compact` does not reset the running totals.
-- **Costs are priced per turn by the tier that turn actually ran at** — the escalation fact above (engine-reported resolved model, OR `usage.model` where faithful): Pro-served tokens at Pro rates, the rest at the cheap ones, with the Pro portion broken out. Attribution is **turn-level**, so a lifted turn is counted entirely as Pro even though its first requests ran cheap — a deliberate slight over-estimate. Ledgers written before v0.2.5 carry no per-tier split (cheap rates); v0.2.5 and earlier decided the tier from `usage.model`, which on a direct DeepSeek endpoint reads as *always cheap* — don't compare cost figures across either line.
+- Ledgers written by 0.2.x still carry cost fields; 0.3.0 neither reads nor writes them. The token counters (`turns` / `input` / `cacheRead` / `output`) are unaffected, so there is nothing to migrate.
 - **A "turn" is whatever the engine says it is.** An async subagent splits one of your messages into **two** engine turns — the delegation closing one, the hand-back opening the next — so the round count can exceed the number of messages you sent. Not a bug: verified against the engine's own `turn_duration` records (which is also where a turn's wall-clock length comes from).
-- If the upgrade skill ran in the **first half** of a turn that a subagent hand-back later split, that continuation half can match the same escalation timestamp and be priced as Pro too — the same over-estimate direction as the turn-level caveat above (it never under-reports).
-- The plugin's **own status strings are Chinese-only** today (`轮次`, `档位构成`, the trim notices), even though this README is bilingual. Prices, model names and the currency prefix are config-driven; the labels themselves are not localized yet.
+- The plugin's **own status strings are Chinese-only** today (`轮次`, `上轮 +`, the trim notices), even though this README is bilingual. Model names are config-driven; the labels themselves are not localized yet.
 - `config.json`'s `_comment` documents every key's exact semantics, including the caveats above — it ships with the plugin.
 
 ## Verify
 
 ```sh
-claude plugin test plugin      # 58 checks: denial / escape hatch / trimming / folding / hard gate / state isolation / pricing / compaction
+claude plugin test plugin      # 51 checks: denial / escape hatch / trimming / folding / hard gate / state isolation / ledger / compaction
 claude plugin validate plugin --strict
 ```
 
@@ -167,4 +155,4 @@ Issues and pull requests are welcome.
 
 MIT © Zoria Lind.
 
-> The repo also carries the older Node / `settings.json` hook layer (`hooks/token-hook.mjs`) that the plugin was ported from. It is deprecated — everything it did now lives inside the plugin — and is documented only in the [Chinese README](README.zh-CN.md). Do not run both: they handle the same events and would double-count and double-trim.
+> The repo also carries the older Node / `settings.json` hook layer (`hooks/token-hook.mjs`) that the plugin was ported from. It is deprecated — everything it did now lives inside the plugin, and it is also the only file left that still contains a price table (the plugin itself has none since 0.3.0) — and is documented only in the [Chinese README](README.zh-CN.md). Do not run both: they handle the same events and would double-count and double-trim.

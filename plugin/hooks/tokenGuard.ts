@@ -50,28 +50,20 @@ const CODE_BASENAMES = new Set(['dockerfile', 'makefile', 'cmakelists.txt'])
 // 但 CC 2.1.293 的工具表里没有它(matcher 是类型化的,会被拒绝)—— 故移除。
 const CODING_TOOLS = ['Edit', 'Write', 'NotebookEdit'] as const
 
-type Tier = { hit: number; miss: number; out: number }
-type PriceTier = { idle: Tier; peak: Tier }
+// ⚠ 2026-10-12:配置里**不再有 pricing / holidays / currency** —— 插件只报 token、不折算金额。
+// 理由(实测):各厂商计费口径不同;同一批 token,平台按"网关自己路由的模型"计费、本插件按"引擎报的
+// 档位"计价,两者曾差 2.5~4 倍,而会话日志**不记录实际服务的模型** ⇒ 金额这一层原则上算不准,索性不报。
+// 故 Cfg 只剩:档位口径、模型名映射、升级启发式(金额一律以你的账单为准)。
 type Cfg = {
   defaultTier: string
-  pricing: { cheap: PriceTier; pro: PriceTier }
-  holidays: string[]
   models: { cheap: string; pro: string }
-  /** 金额前缀(¥ / $ / 元 等)。换供应商时改这里,悬浮条、/token-status、切换成本估算都跟着变。 */
-  currency: string
   /** skillName 非空 → 升档建议让模型调用该技能(技能的 `model:` 头是 CC 里唯一非用户触发的切档通路);
    *  留空 → 退化为通用措辞(建议用户自己 /model)。 */
   upgrade: { keywords: string[]; cooldownMin: number; stickyMin: number; skillName: string }
 }
 const DEFAULT_CONFIG: Cfg = {
   defaultTier: 'pro',
-  pricing: {
-    cheap: { idle: { hit: 0.02, miss: 1, out: 4 }, peak: { hit: 0.04, miss: 2, out: 8 } },
-    pro: { idle: { hit: 0.15, miss: 4.5, out: 13.5 }, peak: { hit: 0.3, miss: 9, out: 27 } },
-  },
-  holidays: ['2026-01-01', '2026-05-01', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'],
   models: { cheap: 'deepseek-v4-flash', pro: 'deepseek-v4-pro[1m]' },
-  currency: '¥',
   upgrade: {
     keywords: ['重构', '编译', '报错', '调试', 'refactor', 'debug', 'bug', '.py', '.ts', '.tsx', '.js', '.mjs', '.jsx', '.ps1', '.sh', '.go', '.rs', '.java', '.cpp'],
     cooldownMin: 10,
@@ -90,7 +82,6 @@ async function loadConfig($: any): Promise<Cfg> {
     cfgCache = {
       ...DEFAULT_CONFIG,
       ...cfg,
-      pricing: { ...DEFAULT_CONFIG.pricing, ...cfg?.pricing },
       models: { ...DEFAULT_CONFIG.models, ...cfg?.models },
       upgrade: { ...DEFAULT_CONFIG.upgrade, ...cfg?.upgrade },
     } as Cfg
@@ -237,7 +228,8 @@ function keywordHit(prompt: string, keywords: string[]): boolean {
 // 升档事实的判据(2026-10-10 重做)。
 // 背景:直连 DeepSeek 时,引擎写进 `turn.complete` 的 `usage.model` 与会话日志的 `model`/`requestedModel`
 // 全都是**会话档位** —— 技能升档它看不见 ⇒ 0.2.5 那条"事实式"判据(读 usage.model)在本机恒为假
-// (实测:真跑在 Pro 上、`/token-status` 却报 `Pro ¥0.000(0 轮)`;近 24h 共 548 条日志零条 pro)。
+// (实测:真跑在 Pro 上,当时的 /token-status 却报 0 轮 Pro —— 那还是 0.3.0 之前带金额显示时的口径;
+//  近 24h 共 548 条日志零条 pro。金额已在 0.3.0 移除,但这条提醒判据仍要靠它绕开 usage.model)。
 // 真正可靠的来源是 **Skill 工具自己的结果**:技能的 frontmatter `model:` 头生效时,引擎把解析到的模型
 // 放进结果里(类型原话:"Resolved model the skill turn runs on when a frontmatter model override took
 // effect; omitted otherwise")。会话日志实测:
@@ -626,8 +618,8 @@ async function modelPolicy($: any, e: any, cfg: Cfg): Promise<string | null> {
   await setSessionModel($, await sessionId($, e), model)
   const adv = tierAdvice(cfg)
   return isProModel(cfg, model)
-    ? `[cc-token-optimizer] 当前 Pro 档(输出 ${cfg.currency}${cfg.pricing.pro.idle.out}/M)。` + adv.stay
-    : `[cc-token-optimizer] 当前基础档(输出 ${cfg.currency}${cfg.pricing.cheap.idle.out}/M)。` + adv.up
+    ? `[cc-token-optimizer] 当前 Pro 档。` + adv.stay
+    : `[cc-token-optimizer] 当前基础档。` + adv.up
 }
 // UserPromptSubmit:机械检测 → 驱动回合级升档。只给模型发**静默**指令,不给用户发预测式提示(见 proNotice)
 async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<string | null> {
@@ -651,17 +643,15 @@ async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<string | null
   )
 }
 // PreModelSwitch:切换成本透明(给用户)
-function preModelSwitch(cfg: Cfg, e: any): string | null {
+function preModelSwitch(e: any): string | null {
   const to = e.to_model
   const from = e.from_model
   if (typeof to !== 'string' || to === from) return null
   const ctx = typeof e.context_tokens === 'number' ? Math.round(e.context_tokens / 1000) : null
-  const tier = isProModel(cfg, to) ? 'pro' : 'cheap'
-  const miss = cfg.pricing[tier].idle.miss
-  const est = ctx !== null ? `,重缓存约 ${cfg.currency}${((ctx * 1000 * miss) / 1_000_000).toFixed(2)}(空闲价)` : ''
+  // 2026-10-12:不再估算"重缓存要多少钱"(插件不报金额,理由见 register.tsx 头部)——只讲 token 事实
   return (
     `[cc-token-optimizer] 切换 ${from ?? '?'} → ${to} 将丢弃当前提示缓存` +
-    (ctx !== null ? `:上下文约 ${ctx}k token` : '') + est +
+    (ctx !== null ? `:上下文约 ${ctx}k token,下次请求要按未命中价重读一遍` : '') +
     `。切换前可考虑先 /compact 或任务边界再切。`
   )
 }
@@ -674,11 +664,11 @@ async function postModelSwitch($: any, e: any, cfg: Cfg): Promise<{ additionalCo
   const pro = isProModel(cfg, to)
   return pro
     ? {
-      additionalContext: `[cc-token-optimizer] 已切 Pro 档(输出 ${cfg.currency}${cfg.pricing.pro.idle.out}/M,${(cfg.pricing.pro.idle.out / cfg.pricing.cheap.idle.out).toFixed(1)}x 基础档)。` + adv.stay,
+      additionalContext: `[cc-token-optimizer] 已切 Pro 档(更强、也更贵;具体金额以你的账单为准)。` + adv.stay,
       toast: `[cc-token-optimizer] 已切 Pro 档 · ${adv.stay}`,
     }
     : {
-      additionalContext: `[cc-token-optimizer] 已切基础档(输出 ${cfg.currency}${cfg.pricing.cheap.idle.out}/M)。` + adv.up,
+      additionalContext: `[cc-token-optimizer] 已切基础档。` + adv.up,
       toast: `[cc-token-optimizer] 已切基础档 · ${adv.up}`,
     }
 }
@@ -744,7 +734,7 @@ async function markSkillUpgrade($: any, e: any): Promise<void> {
   await toast(
     $,
     `[cc-token-optimizer] 本回合已升到 Pro 档(${how})。` +
-      `输出 ${cfg.currency}${cfg.pricing.pro.idle.out}/M,下一轮自动回落;` +
+      `下一轮自动回落;` +
       `想让整段会话都用 Pro 就 /model ${cfg.models.pro}。`
   )
 }
@@ -791,7 +781,7 @@ export const register: Register = (on, options) => {
   on('classic.PreModelSwitch', async ($, e, next) => {
     try {
       const cfg = await loadConfig($)
-      const msg = preModelSwitch(cfg, e)
+      const msg = preModelSwitch(e)
       if (msg) await toast($, msg)
     } catch { /* fail-open */ }
     return next(e)
