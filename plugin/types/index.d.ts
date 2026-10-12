@@ -51,7 +51,7 @@ export type GuardBucket = {
    *  hand-back 以 user 角色消息注入),序号被顶高 ⇒ 已升档的回合仍被白拦一次(2026-10-11 现场复现)。 */
   _epoch?: number
   /** 升档时刻(2026-10-10):`classic.PostToolUse(Skill)` 从引擎报的解析模型确认"本回合走了强档"。
-   *  账本(register.tsx guardProHit)按**时间窗**归属;闸看的是同一刻的 `_proEpoch`。 */
+   *  闸看的是同一刻的 `_proEpoch`(0.3.0 起金额分账已移除,不再有按时间窗归属的消费者)。 */
   _proAt?: number
   /** 升档时 `_epoch` 的值 ⇒ `_proEpoch === _epoch` 即"本回合已升过档"(闸据此放行)。 */
   _proEpoch?: number
@@ -59,6 +59,8 @@ export type GuardBucket = {
   _proNoticeAt?: number
   /** 硬升档闸上次强制发生的 `_epoch` ⇒ `=== _epoch` 即"本回合已强制过"(每回合最多拦一次)。 */
   _forcedEpoch?: number
+  /** 自动升档已关时,上次发「插件本轮不推升档」提示的 `_epoch` ⇒ `=== _epoch` 即"本回合已提示过"。 */
+  _offNoticeEpoch?: number
 } & Record<string, unknown>
 
 /**
@@ -67,6 +69,11 @@ export type GuardBucket = {
  *   落点:`<配置目录>/plugins/store/cc-token-optimizer*.json`。
  */
 export type GuardState = {
+  /** 自动升档开关(`/tier-auto`,2026-10-12 / 0.3.0):`false` = 关 —— 闸不拦、模型侧不注入提醒,
+   *  只在"本回合首次改代码文件"那一刻提示一次;缺省/undefined = 开(老 store 无需迁移)。
+   *  **用户级持久偏好**:由 mods 层的命令写、hooks 层读。开关归用户、不归模型。
+   *  ⚠ pruneState 必须像 `_strikes`/`_stats` 那样排除本键 —— 它没有 `_at`,否则会被 LRU 当会话桶第一个淘汰。 */
+  _tierAuto?: boolean
   /** 同文件连续拦截计数(逃生,防"内容不在却报已在"的死锁)。 */
   _strikes?: Record<string, Record<string, number>>
   /** 每会话的拦截/裁剪/折叠计数。 */

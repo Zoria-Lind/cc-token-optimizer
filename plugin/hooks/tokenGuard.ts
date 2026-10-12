@@ -291,6 +291,16 @@ async function readState($: any): Promise<any> {
 async function writeState($: any, s: any): Promise<void> {
   try { await $.store.set(STORE_KEY, s) } catch { /* 写失败不致命 */ }
 }
+// 自动升档开关(2026-10-12 / 0.3.0):**用户级持久偏好**,落 guard-state 的顶层键 `_tierAuto`
+//   false ⇒ 关:闸不拦、模型侧不注入、SessionStart 改口径,只在"本回合首次改代码文件"那一刻提示一次;
+//   缺省(undefined)⇒ 开,与 0.3.0 之前的行为一致 —— 老 store 不需要迁移。
+// 为什么放这儿:命令(mods 层)没有写 settings/插件选项的 API,而 store 是插件唯一可写区、升级也不覆盖。
+// ⚠ 顶层键以 `_` 开头 ⇒ pruneState 必须像 `_strikes`/`_stats` 一样把它排除,否则会被 LRU 当会话桶淘汰。
+// 红线:开关**归用户、不归模型** —— 关掉只是"插件不再推",模型自己判断该上强档时仍可调技能,用户也随时可 /model。
+async function tierAutoOn($: any): Promise<boolean> {
+  const st = await readState($)
+  return st._tierAuto !== false
+}
 function statEntry(state: any, session: string) {
   state._stats = state._stats ?? {}
   const s = (state._stats[session] ??= { denies: 0, trims: 0, trimmedChars: 0, collapsedLines: 0 })
@@ -336,7 +346,9 @@ async function archiveOriginal($: any, session: string, tool: string, raw: strin
 }
 // 修剪:状态跨会话累积在同一个 store 文件里(有 4 MiB 上限),保留最近活跃的若干会话桶
 function pruneState(state: any): void {
-  const keys = Object.keys(state).filter((k) => k !== '_strikes' && k !== '_stats')
+  // ⚠ 非会话桶的顶层键都要在这里排除:`_strikes` / `_stats` 是老住户,`_tierAuto`(0.3.0 的自动升档开关)
+  //   没有 `_at` 字段 ⇒ 一旦被当成会话桶参与 LRU,它永远排最后、**第一次修剪就会被删掉**。
+  const keys = Object.keys(state).filter((k) => k !== '_strikes' && k !== '_stats' && k !== '_tierAuto')
   const mains = keys.filter((k) => !k.includes('::agent:'))
   const byAge = [...mains].sort((a, b) => (state[b]?._at ?? 0) - (state[a]?._at ?? 0))
   const dropped = new Set(byAge.slice(SESSION_KEEP))
@@ -496,13 +508,8 @@ async function codingToolGate($: any, e: any): Promise<string | null> {
   const cfg = await loadConfig($)
   const skill = effectiveSkill(cfg)
   if (skill) {
-    let live: unknown = null
-    try { live = await $.session.model() } catch { /* 取不到当未知 */ }
     // 「本回合」= `_epoch`(只由 turn.complete 自增,见 noteTurnEnd)
     const epoch = sess._epoch ?? 0
-    // 本回合是否已经处于强档:①会话基础档就是 Pro;②**本回合已经调用过强档技能**(PostToolUse(Skill)
-    // 落的 _proEpoch,见 markSkillUpgrade)。`$.session.model()` 读的是**会话基础档**,技能切档它看不见。
-    const alreadyPro = isProModel(cfg, live) || (sess._proEpoch ?? -1) === epoch
     // ⚠ 2026-10-11 修(发布前复核抓出):**子 agent 的改动一律不拦**。
     // 子 agent 跑的是子代理模型(本机 CLAUDE_CODE_SUBAGENT_MODEL=flash),而技能 `model:` 头切的是
     // **会话那一轮**的模型 —— 已经在跑的那一轮子 agent 切不动 ⇒ 拦下来的建议(先调 Skill)它执行不了,
@@ -510,17 +517,36 @@ async function codingToolGate($: any, e: any): Promise<string | null> {
     // 于是主线程本回合**自己**第一次改代码反而不拦了 —— 一次不该发生的拦截换掉了一次该发生的。
     // 子 agent 的改动照旧落 _codingAt(粘性窗口口径不变,见上面那行)。
     const fromAgent = !!(e?.agent_id ?? e?.agentId)
-    // 只拦代码文件(改文档不拦);档位未知时不拦:拦了却给不出可行的下一步,比不拦更糟(fail-open)
-    if (
-      !fromAgent &&
-      (sess._forcedEpoch ?? -1) !== epoch &&
-      isCode &&
-      typeof live === 'string' && live !== '' && !alreadyPro
-    ) {
-      sess._forcedEpoch = epoch
-      deny =
-        `[cc-token-optimizer] 本回合首次改动代码,而本会话档位是基础档:请先调用 Skill 工具(${skill}) ` +
-        `让后续在强档执行(回合级、下一轮自动回落),然后**重试刚才那次调用** —— 只多花一次往返。`
+    if (!(await tierAutoOn($))) {
+      // ⭐ 自动升档已关(/tier-auto off,2026-10-12):**不拦**,改成在**与闸完全相同的那个零误报触发点**
+      // 上提示一次 —— 插件不再替你决定,但把判断亮出来,由你自己决定要不要 /model(手动挡)。
+      // ⚠ 文案只说"插件不推"(机械层做得到的事),**绝不写"本轮不升档"**:技能的 `model:` 头模型自己
+      //   就能调,那是插件保证不了的承诺 —— 与 0.2.5 被砍掉的"本回合按 Pro 档执行"是同一类误述。
+      // ⚠ 提示**只挂这个触发点**(真的改代码文件),**不挂关键词/粘性窗口** —— 后者在 30 分钟窗口里
+      //   逐轮点燃,等于把 0.2.5 拆掉的误报机重造一遍。
+      // 每回合最多一次:与闸同一套 `_epoch`,字段分开记(`_offNoticeEpoch`)以免与 `_forcedEpoch` 语义混用。
+      if (!fromAgent && isCode && (sess._offNoticeEpoch ?? -1) !== epoch) {
+        sess._offNoticeEpoch = epoch
+        await toast($, `[cc-token-optimizer] 自动升档已关 · 插件本轮不推升档;要强档请 /model ${cfg.models.pro}`)
+      }
+    } else {
+      let live: unknown = null
+      try { live = await $.session.model() } catch { /* 取不到当未知 */ }
+      // 本回合是否已经处于强档:①会话基础档就是 Pro;②**本回合已经调用过强档技能**(PostToolUse(Skill)
+      // 落的 _proEpoch,见 markSkillUpgrade)。`$.session.model()` 读的是**会话基础档**,技能切档它看不见。
+      const alreadyPro = isProModel(cfg, live) || (sess._proEpoch ?? -1) === epoch
+      // 只拦代码文件(改文档不拦);档位未知时不拦:拦了却给不出可行的下一步,比不拦更糟(fail-open)
+      if (
+        !fromAgent &&
+        (sess._forcedEpoch ?? -1) !== epoch &&
+        isCode &&
+        typeof live === 'string' && live !== '' && !alreadyPro
+      ) {
+        sess._forcedEpoch = epoch
+        deny =
+          `[cc-token-optimizer] 本回合首次改动代码,而本会话档位是基础档:请先调用 Skill 工具(${skill}) ` +
+          `让后续在强档执行(回合级、下一轮自动回落),然后**重试刚才那次调用** —— 只多花一次往返。`
+      }
     }
   }
   await writeState($, state)
@@ -617,14 +643,19 @@ async function modelPolicy($: any, e: any, cfg: Cfg): Promise<string | null> {
   if (typeof model !== 'string' || model === '') return null
   await setSessionModel($, await sessionId($, e), model)
   const adv = tierAdvice(cfg)
+  // 自动升档已关时必须一起改口径:否则模型照旧"拿不准就建议升 Pro",等于关了没关(2026-10-12)
+  const off = (await tierAutoOn($)) ? '' : ' 自动升档已由用户关闭(/tier-auto on 恢复):不要主动建议升档,用户明确要求强档时再照办。'
   return isProModel(cfg, model)
-    ? `[cc-token-optimizer] 当前 Pro 档。` + adv.stay
-    : `[cc-token-optimizer] 当前基础档。` + adv.up
+    ? `[cc-token-optimizer] 当前 Pro 档。` + adv.stay + off
+    : `[cc-token-optimizer] 当前基础档。` + adv.up + off
 }
 // UserPromptSubmit:机械检测 → 驱动回合级升档。只给模型发**静默**指令,不给用户发预测式提示(见 proNotice)
 async function upgradeHeuristic($: any, e: any, cfg: Cfg): Promise<string | null> {
   const prompt = e.prompt
   if (typeof prompt !== 'string' || prompt.trim() === '') return null
+  // 自动升档已关(2026-10-12):模型侧的静默提醒也不发 —— 关掉的是"推",不是"报"
+  // (真升档了那条 toast 与账本计数照旧;SessionStart 的口径也已在 modelPolicy 里改掉)。
+  if (!(await tierAutoOn($))) return null
   const session = await sessionId($, e)
   const state = await readState($)
   const up = cfg.upgrade

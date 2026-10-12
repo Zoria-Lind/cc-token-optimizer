@@ -256,6 +256,44 @@ test('硬升档闸:没配 skillName → 不拦,但粘性窗口照记', async ($,
   expect(JSON.stringify(held)).toMatch(/_codingAt/)
 })
 
+// —— /tier-auto:自动升档开关(2026-10-12 / 0.3.0)——
+//    关掉后闸不拦、模型侧不注入提醒;但会在**本回合首次改代码文件**那一刻给用户提示一次(手动挡)。
+test('tier-auto 关:改代码文件不拦,改成提示一次(手动挡)', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  b.store.set('guard-state', { _tierAuto: false })
+  const r = await $.tool.call(editArgs('/x.ts', 'ed1'))
+  expect(JSON.stringify(r)).not.toMatch(/my-upgrade-skill/) // 不拦
+  expect(b.toasts.join(' ')).toMatch(/自动升档已关/) // 提示一次
+  expect(b.toasts.join(' ')).not.toMatch(/本轮不升档/) // ⚠ 文案不许写成"插件保证不了"的承诺
+})
+
+test('tier-auto 关:提示每回合最多一次(同回合第二次改代码不再提示)', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  b.store.set('guard-state', { _tierAuto: false })
+  await $.tool.call(editArgs('/x.ts', 'ed1'))
+  const n = b.toasts.length
+  await $.tool.call(editArgs('/y.ts', 'ed2'))
+  expect(b.toasts.length).toBe(n)
+})
+
+test('tier-auto 关:模型侧静默提醒不注入(命中 coding 关键词也不发)', async ($, on) => {
+  const b = setupGuard(on)
+  b.store.set('guard-state', { _tierAuto: false })
+  const r = await $.classic.UserPromptSubmit({ prompt: '这里报错了,帮我调试一下' })
+  expect(JSON.stringify(r)).not.toMatch(/coding 信号|Skill\(/)
+  expect(b.toasts.length).toBe(0)
+})
+
+test('tier-auto 开(缺省,老 store 无该键):行为与 0.3.0 之前一致 —— 照拦', async ($, on) => {
+  const b = setupGuard(on)
+  b.files.set('/plugin/config.json', { text: skillCfg, mtimeMs: 1, size: 40 })
+  const r = await $.tool.call(editArgs('/x.ts', 'ed1'))
+  expect(JSON.stringify(r)).toMatch(/my-upgrade-skill/)
+  expect(b.toasts.join(' ')).not.toMatch(/自动升档已关/)
+})
+
 test('升档粘性窗口:改文档(.md)不落 _codingAt —— 纯文档轮不该被判成 coding 流', async ($, on) => {
   const b = setupGuard(on)
   await $.tool.call({ tool: 'Edit', file_path: '/notes.md', old_string: 'a', new_string: 'b', tool_use_id: 'md-sticky' })

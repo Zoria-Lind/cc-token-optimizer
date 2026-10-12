@@ -160,6 +160,30 @@ test('上轮 +Δ = 上一轮 input+read+creation+output 之和', async ($, on) =
   expect(out.text).toMatch(/上轮 \+6k/) // 1000+200+5000 = 6200 → fmt 取整到 6k
 })
 
+// —— /tier-auto:自动升档开关(2026-10-12 / 0.3.0)。开关住在 guard-state 顶层键 `_tierAuto`。 ——
+const runCmdArgs = ($: any, command: string, args: string) => $.command.run({ command, args })
+
+test('/tier-auto:off / on 写进 guard-state,并回执当前状态', async ($, on) => {
+  const b = setup(on)
+  await start($)
+  const off = await runCmdArgs($, 'tier-auto', 'off')
+  expect(off.text).toMatch(/自动升档:关/)
+  expect(JSON.stringify(b.guardStore.get('guard-state'))).toMatch(/"\_tierAuto":false/)
+  expect((await runCmd($, 'tier-auto')).text).toMatch(/自动升档:关/) // 空参看状态(持久,不靠内存)
+  expect((await runCmdArgs($, 'tier-auto', 'on')).text).toMatch(/自动升档:开/)
+  expect(JSON.stringify(b.guardStore.get('guard-state'))).toMatch(/"\_tierAuto":true/)
+})
+
+test('/tier-auto 关掉后:账本照常计(开关只管"推",不影响 token 计数与上轮增量)', async ($, on) => {
+  setup(on)
+  await start($)
+  await runCmdArgs($, 'tier-auto', 'off')
+  await turn($, { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, undefined)
+  const out = await runCmd($, 'token-status')
+  expect(out.text).toMatch(/轮次: 1/)
+  expect(out.text).toMatch(/上轮 \+110/)
+})
+
 // 悬浮条(AbovePrompt)不做单元断言:测试框架要求 ui.render 的 bottom 返回真实树元素,
 // 而元素构造器只存在于引擎内部,测试 bottom 拿不到。其验证由三层兜底:
 // engine validate(API 形状)+ 热重载零失败(引擎加载)+ /token-status(数据路径)+ 用户肉眼(输入框上方)。

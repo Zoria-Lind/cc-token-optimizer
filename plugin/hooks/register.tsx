@@ -163,6 +163,11 @@ export const register: Register = (on, options) => {
         name: 'token-status',
         description: 'cc-token-optimizer:上下文压力/累计 token/缓存命中率',
       })
+      // /tier-auto:自动升档开关(2026-10-12 / 0.3.0),默认开
+      await $.command.register({
+        name: 'tier-auto',
+        description: 'cc-token-optimizer:自动升档开关(on / off;off = 不拦也不提醒,只在动手改代码时提示一次)',
+      })
     } catch { /* fail-open */ }
     return next(_e)
   }).catch(($, e, next) => (next.called ? next(e) : undefined))
@@ -249,6 +254,9 @@ export const register: Register = (on, options) => {
     let model: string | null = null
     try { model = (await $.session.model()) ?? null } catch { /* fail-open */ }
     const outShare = totalIn > 0 ? Math.round((100 * T.output) / (totalIn + T.output)) : null
+    // 发现性(设计稿要求):开关状态顺带打在这里 —— 否则用户永远不知道有 /tier-auto 这个东西
+    let tierAuto = true
+    try { tierAuto = (((await $.store.get(GUARD_STATE_KEY)) as any)?._tierAuto) !== false } catch { /* fail-open:按默认(开)报 */ }
     let compactLine = ''
     let compactNote = ''
     try {
@@ -267,6 +275,7 @@ export const register: Register = (on, options) => {
         `- 输入 ${fmt(T.input)} / 缓存读 ${fmt(T.cacheRead)} / 缓存写 ${fmt(T.cacheCreation)} / 输出 ${fmt(T.output)}${T.lastTurnTokens > 0 ? `(上轮 +${fmt(T.lastTurnTokens)})` : ''}`,
         `- 缓存命中率: ${hit !== null ? `${hit.toFixed(1)}%` : '暂无数据'}`,
         outShare !== null ? `- 输出占比 ${outShare}%(输出含思考 token)` : '- 输出占比: 暂无数据',
+        `- 自动升档: ${tierAuto ? '开(改代码文件的首次调用会先拦一次)' : '**关**(不拦也不给模型发提醒;要恢复:/tier-auto on)'}`,
         `- 统计窗口: 会话始于 ${stamp(T.startedAt)} · 首轮于 ${hm(T.firstAt)} · 本实例 register 加载 ${T.loads.length} 次${T.loads.length > 1 ? '(热重载过 → 已续计,未丢轮次)' : '(未重载)'}${T.loads.length >= 20 ? ' ⚠ 加载次数触顶,可能频繁重载' : ''}`,
         '- 口径: 来自 turn.complete usage 聚合(仅主会话);**只报 token,不折算金额** —— 各厂商计费口径不同,而 token 是厂商无关的硬事实。实测同一批 token,平台按"网关自己路由的模型"计费、本插件按"引擎报的档位"计价,两者曾差 2.5~4 倍,且会话日志**不记录实际服务的模型** ⇒ 0.3.0 起彻底移除金额显示,钱一律以你的账单为准。计数持久在 $.state,热重载不清零。',
         '- 档位/升级规则在 plugin/config.json(价目表已随 0.3.0 移除)。',
@@ -274,6 +283,32 @@ export const register: Register = (on, options) => {
         compactLine,
       ].filter(Boolean).join('\n'),
       context: compactNote ? [compactNote] : undefined,
+    }
+  })
+
+  // /tier-auto —— 自动升档开关(2026-10-12 / 0.3.0)。默认开;关掉后闸不拦、模型侧不注入提醒,
+  // 只在"本回合首次改代码文件"那一刻提示一次(手动挡)。状态落 guard-state 的顶层键 `_tierAuto`。
+  // ⚠ 开关归用户、不归模型:关掉只是"插件不再推",模型自行判断要强档时仍可调技能,用户也随时可 /model。
+  on('command.run', { command: 'tier-auto' }, async ($, e) => {
+    const raw = (e as any)?.args
+    const arg = (Array.isArray(raw) ? raw.join(' ') : String(raw ?? '')).trim().toLowerCase()
+    let enabled = true // ⚠ 不能叫 `on`:`on` 是 register 的形参(注册函数),同名会被插件验证器判为遮蔽
+    try {
+      const st = ((await $.store.get(GUARD_STATE_KEY)) ?? {}) as any
+      if (arg === 'on' || arg === 'off') {
+        st._tierAuto = arg === 'on'
+        await $.store.set(GUARD_STATE_KEY, st)
+      }
+      enabled = st._tierAuto !== false
+    } catch { /* fail-open:读不到就按默认(开)报状态 */ }
+    return {
+      text: [
+        `cc-token-optimizer 自动升档:${enabled ? '开' : '关'}`,
+        enabled
+          ? '- 当前:本回合首次改动代码文件时会先拦一次、要模型先调用强档技能再重试(硬升档闸);命中 coding 关键词或粘性窗口时也会给模型发一条静默提醒。'
+          : '- 当前:**不拦、也不给模型发提醒**;只在你真的动手改代码文件那一刻提示一次「自动升档已关 · 插件本轮不推升档」。要强档请自己 /model。',
+        '- 用法:`/tier-auto off` 关,`/tier-auto on` 开,不带参数看状态。开关持久、跨会话有效。',
+      ].join('\n'),
     }
   })
 }

@@ -45,7 +45,7 @@ Nothing else on your machine is touched: the only things it writes are its own s
 | **recordRead** | after that same Read | Stores mtime/size + read ranges (v2 format, bucketed per session / sub-agent, LRU-pruned), keyed by the file's **resolved** path (so `D:\a\b.ts` and `D:/a/b.ts` are one record) and holding the range the tool **actually returned** — a token-capped read is recorded as the page the model really saw, not as what was asked for. |
 | **outputTrim** | `PostToolUse` Bash/PowerShell | Folds runs of ≥3 identical lines; if the output is still over 5000 chars, head/tail samples are injected (1500+1500; 800+800 when the command failed). **Whenever anything is folded or trimmed, the full original is archived to disk first** and the archive path is appended to what the model sees. (Archive writes go through the host's `fs.write`, which refuses anything over 4 MiB — a larger output gets trimmed with no archive path.) |
 | **coldStartGuard** | `SessionStart` | A resumed session whose prompt cache has expired gets one line: context size, how many tokens the next request will have to re-read, and "consider `/clear`". |
-| **modelDirector** | `SessionStart` · `UserPromptSubmit` · `tool.call` Edit/Write/NotebookEdit · `PreModelSwitch` · `PostModelSwitch` | Tier discipline: mechanical upgrade nudges + an **optional hard gate** + a transparent switch warning, in tokens (see below). |
+| **modelDirector** | `SessionStart` · `UserPromptSubmit` · `tool.call` Edit/Write/NotebookEdit · `PreModelSwitch` · `PostModelSwitch` | Tier discipline: mechanical upgrade nudges + an **optional hard gate** + a transparent switch warning, in tokens (see below). All of it is switchable off with `/tier-auto off`. |
 | **tierFact** | `PostToolUse` Skill | Reads the resolved model out of the Skill tool's own result — the only trustworthy escalation signal against a direct DeepSeek endpoint — and when it is a Pro model records the fact (`_proAt` / `_proEpoch`) and toasts you **at the moment it happens**. The hard gate reads that fact (0.3.0: nothing else does — cost accounting is gone). |
 | **compactReset** | `session.compact` | Drops the session's read records at a compaction: the harness clears old tool output out of context when it compacts, so every "you already read this" record is stale from that point on. `trigger: "precompute"` is skipped — it is the one dispatch that installs nothing. |
 | **status bar** · `/token-status` | AbovePrompt · slash command | rounds, context size, input + cache read/write, output, cache-hit rate, **and how much the last turn added (`上轮 +Δ`)**; the command adds the output share and the session window. ⚠ **Session-cumulative, and tokens only — there is no money figure anywhere** (see *What the numbers mean*). |
@@ -81,6 +81,7 @@ The resident tier comes from `defaultTier` in `plugin/config.json`, and the disc
 
 - **`cheap` (shipped default)**: starts on the cheap model every session; you upgrade when needed and the next session falls back automatically. **The upgrade trigger is deliberately human by default** — if you let the cheap model judge for itself whether to escalate, it cannot see what it is missing, so it hesitates, grinds through work it is bad at, and is not equipped to report "I got worse" (measured the hard way on 2026-10-07).
 - **`pro`**: stay on the strong model, delegate legwork to subagents (one less tier switch, more expensive).
+- **Turning the nudging off — `/tier-auto`** (0.3.0): `/tier-auto off` switches the plugin from *pushing* to *reporting*. The hard gate stops denying, the model-side nudges stop being injected, and the SessionStart text becomes "do not suggest upgrading". What is left is **one toast, fired at exactly the gate's trigger** (the turn's first code-file edit — a signal that cannot false-positive): *"自动升档已关 · 插件本轮不推升档"*. You keep the signal and make the call yourself. `/tier-auto on` restores the default; the setting persists across sessions (it lives in the plugin's own store, not in your config). ⚠ It **never claims "this turn will not upgrade"** — a skill's `model:` header is something the model can call at any time, so the plugin can only promise not to *push*. The same switch shows up as a line in `/token-status`.
 
 Events:
 
@@ -128,6 +129,7 @@ Events:
 
 - **The plugin reports tokens, not money — deliberately.** Billing rules belong to your provider, and they do not have to follow the model name the engine reports: on one gateway, **9 of 15 calls in a stretch were billed as Pro while nothing in that session had escalated**, and the log said `flash` for every one of them. Cost figures derived from those labels were off by **2.5–4×** against a real bill, so 0.3.0 removed them outright. Your bill is the only source of truth for money; this plugin's job is to keep the token counts honest.
 - **The hard gate's price**: its judgement reads the session's *base* tier, but it also accepts this turn's escalation fact, so **a turn that already escalated is not denied again**; at most once per turn; and it is completely off unless you configure a skill name.
+- **`/tier-auto off` silences the plugin, not the model.** The gate and the nudges stop; a `model:`-header skill can still be called (by you or by the model), and nothing is watching whether a coding turn is running on the cheap tier. That was the gate's whole job — with the switch off you are doing it yourself.
 - **The upgrade nudge names a skill**, and a skill's `model:` header is the only way a plugin can switch tiers without you typing `/model`. With no skill name anywhere, the advice degrades to a plain "switch with `/model`".
 - **readDedup** compares mtime + size rather than content hashes (a same-second, same-size rewrite is missed), and recent Claude Code builds already answer whole-file re-reads natively — the remaining value is partial-overlap merging and long-span re-reads.
 - A denied read or edit costs one failed round while the model retries; hence the 3-strike escape hatch on reads.
@@ -142,7 +144,7 @@ Events:
 ## Verify
 
 ```sh
-claude plugin test plugin      # 51 checks: denial / escape hatch / trimming / folding / hard gate / state isolation / ledger / compaction
+claude plugin test plugin      # 57 checks: denial / escape hatch / trimming / folding / hard gate / tier switch / state isolation / ledger / compaction
 claude plugin validate plugin --strict
 ```
 
