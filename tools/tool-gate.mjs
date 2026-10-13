@@ -3,8 +3,11 @@
 //   tier1_remove  确认不用的 → 移除
 //   tier2_hide    偶尔用的 → 同样移出调用范围,但保留在名单里,enable 一条命令召回
 // 机制(2026-10-08 实测定型,取代已证实失效的 settings tools.disabled):
-//   落点1 <配置目录>/agents/tool-gate.md 的 disallowedTools —— 主线程工具真实移除(CC 2.1.292 实测)
-//   落点2 settings.json 的 "agent": "tool-gate" —— 裸启动/任意目录自动生效,无需改启动方式
+//   落点1 <配置目录>/agents/default.md 的 disallowedTools —— 主线程工具真实移除(CC 2.1.292 实测)
+//   落点2 settings.json 的 "agent": "default" —— 裸启动/任意目录自动生效,无需改启动方式
+//   ⚠ 名字必须中性(2026-10-13 由 tool-gate 改成 default):agent 名会外溢成**终端标题的第三档兜底**
+//     (标题链 = 真标题 ?? AI 标题 ?? agent 名 ?? "Claude Code"),且设了 agent 会**抑制 AI 标题生成**
+//     ⇒ 旧名字会变成每个会话的窗口标题、且永远等不到真标题(改名只治标:抑制仍在,兜底换成中性名)
 //   ⚠ 该 agent 文件由本工具生成,body 必须保持空!非空 prompt 会整个替换默认系统提示(实测)。
 //   改完需重启会话生效(agent 于会话启动时解析)。CC 升级后建议用探针复验。
 // 用法:
@@ -23,8 +26,8 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const TIERS_FILE = join(HERE, 'tiers.json')
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 const SETTINGS_FILE = join(CONFIG_DIR, 'settings.json')
-const AGENT_FILE = join(CONFIG_DIR, 'agents', 'tool-gate.md')
-const AGENT_NAME = 'tool-gate'
+const AGENT_FILE = join(CONFIG_DIR, 'agents', 'default.md')
+const AGENT_NAME = 'default'
 const BACKUP_KEEP = 3
 
 function readJson(p) {
